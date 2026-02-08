@@ -2,8 +2,6 @@
 업비트 자동 매매 봇 - 메인 실행 파일
 """
 
-
-
 import json
 import time
 import threading
