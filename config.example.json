@@ -1,0 +1,79 @@
+{
+  "_comment": "설정 예시 파일 - 실제 사용 시 config.json으로 복사하여 사용하세요",
+  
+  "api": {
+    "_comment": "업비트 Open API 키 (https://upbit.com/mypage/open_api_management)",
+    "access_key": "여기에_Access_Key_입력",
+    "secret_key": "여기에_Secret_Key_입력"
+  },
+  
+  "trading": {
+    "_comment": "거래 기본 설정",
+    "max_coins": 3,
+    "buy_amount_krw": 100000,
+    "min_trade_amount": 5500,
+    "check_interval_seconds": 10
+  },
+  
+  "coin_selection": {
+    "_comment": "코인 선정 기준",
+    "min_volume_krw": 10000000000,
+    "min_volatility": 3,
+    "max_volatility": 15,
+    "lookback_days": 1,
+    "refresh_interval_hours": 1,
+    "excluded_coins": ["BTC", "ETH"]
+  },
+  
+  "indicators": {
+    "_comment": "기술 지표 설정",
+    "bb_period": 20,
+    "bb_std": 2,
+    "rsi_period": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "min_signals_required": 3
+  },
+  
+  "risk_management": {
+    "_comment": "리스크 관리 설정",
+    "stop_loss_pct": -1.5,
+    "take_profit_1_pct": 1.5,
+    "take_profit_1_ratio": 0.5,
+    "take_profit_2_pct": 3.0,
+    "take_profit_2_ratio": 0.3,
+    "trailing_stop_pct": 1.0,
+    "trailing_activation_pct": 2.0
+  },
+  
+  "logging": {
+    "_comment": "로깅 설정",
+    "log_dir": "logs",
+    "rotation_hours": 24,
+    "max_backup_count": 30,
+    "console_log_level": "INFO",
+    "file_log_level": "DEBUG"
+  },
+  
+  "_settings_guide": {
+    "conservative": {
+      "_comment": "보수적 설정 (안정성 우선)",
+      "buy_amount_krw": 50000,
+      "stop_loss_pct": -1.0,
+      "min_signals_required": 4
+    },
+    "aggressive": {
+      "_comment": "공격적 설정 (수익성 우선)",
+      "buy_amount_krw": 200000,
+      "stop_loss_pct": -2.0,
+      "min_signals_required": 2
+    },
+    "balanced": {
+      "_comment": "균형 설정 (기본값)",
+      "buy_amount_krw": 100000,
+      "stop_loss_pct": -1.5,
+      "min_signals_required": 3
+    }
+  }
+}
