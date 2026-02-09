@@ -1,4 +1,4 @@
-# 🤖 QuantPilot - 업비트 자동매매 봇
+# 🤖 upbit_trading_bot - 업비트 자동매매 봇
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -155,8 +155,8 @@ MDD: -5~8%
 
 ```bash
 # 저장소 클론
-git clone https://github.com/yourusername/quantpilot.git
-cd quantpilot
+git clone https://github.com/seung628/upbit_trading_bot.git
+cd upbit_trading_bot
 
 # 패키지 설치
 pip install -r requirements.txt
@@ -335,8 +335,8 @@ python main.py
 ```
 1. @BotFather 검색
 2. /newbot 입력
-3. 봇 이름: QuantPilot Trading Bot
-4. 사용자명: quantpilot_bot
+3. 봇 이름: upbit_trading_bot
+4. 사용자명: upbit_trading_bot
 5. 토큰 받기
 ```
 
@@ -575,7 +575,7 @@ MIT License
 ## 📞 문의
 
 - Issues: [GitHub Issues](https://github.com/seung628/upbit_trading_bot/issues)
-- Email: your.email@example.com
+- Email: seung628@gmail.com
 
 ---
 
