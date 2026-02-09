@@ -265,6 +265,10 @@ class TradingBot:
             elif cmd == '/balance' or cmd == '/잔고':
                 self._telegram_balance()
             
+            # /refresh - 종목 갱신
+            elif cmd == '/refresh' or cmd == '/갱신':
+                self._telegram_refresh()
+            
             # /pause - 일시 정지
             elif cmd == '/pause' or cmd == '/정지':
                 self._telegram_pause()
@@ -408,6 +412,60 @@ class TradingBot:
         
         self.telegram.send_message(message)
     
+    def _telegram_refresh(self):
+        """텔레그램: 종목 갱신"""
+        if not self.is_running:
+            self.telegram.send_message("⚠️ 프로그램이 실행 중이 아닙니다.")
+            return
+        
+        # 현재 목록
+        old_coins = set(self.target_coins)
+        
+        # 새 목록 선정
+        new_coins = self.coin_selector.get_top_coins(self.max_coins)
+        
+        if not new_coins:
+            self.telegram.send_message("❌ 종목 선정 실패")
+            return
+        
+        new_coins_set = set(new_coins)
+        
+        # 변경사항
+        added = new_coins_set - old_coins
+        removed = old_coins - new_coins_set
+        kept = old_coins & new_coins_set
+        
+        # 목록 업데이트
+        self.target_coins = new_coins
+        self.last_coin_refresh = datetime.now()
+        
+        message = f"""🔄 <b>종목 갱신 완료</b>
+
+📊 변경사항
+유지: {len(kept)}개
+추가: {len(added)}개
+제외: {len(removed)}개
+"""
+        
+        if added:
+            added_names = [c.replace('KRW-', '') for c in added]
+            message += f"\n➕ 추가: {', '.join(added_names)}"
+        
+        if removed:
+            removed_names = []
+            for coin in removed:
+                name = coin.replace('KRW-', '')
+                if coin in self.stats.positions:
+                    removed_names.append(f"{name} 📍")
+                else:
+                    removed_names.append(name)
+            message += f"\n➖ 제외: {', '.join(removed_names)}"
+        
+        message += "\n\n💡 제외된 종목의 포지션은 유지됩니다"
+        
+        self.telegram.send_message(message)
+        self.logger.info(f"텔레그램: 종목 갱신 - 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
+    
     def _telegram_pause(self):
         """텔레그램: 일시 정지"""
         if not self.is_running:
@@ -438,6 +496,7 @@ class TradingBot:
 /balance - 잔고 확인
 
 🎮 <b>제어</b>
+/refresh - 종목 목록 갱신
 /pause - 일시 정지
 /resume - 거래 재개
 
@@ -603,6 +662,70 @@ class TradingBot:
             print(f"  {emoji} {coin}: {stats['trades']}회 | {stats['profit']:+,.0f}원")
         
         print("="*80 + "\n")
+    
+    def refresh_coins(self):
+        """종목 목록 수동 갱신 (포지션 유지)"""
+        
+        if not self.is_running:
+            print("⚠️  트레이딩이 실행 중이 아닙니다.")
+            print("   'start' 명령어로 먼저 시작하세요.")
+            return
+        
+        print("\n" + "="*80)
+        print("🔄 종목 목록 갱신")
+        print("="*80)
+        
+        # 현재 목록
+        old_coins = set(self.target_coins)
+        print(f"\n📋 현재 목록 ({len(old_coins)}개)")
+        for coin in old_coins:
+            in_position = "📍" if coin in self.stats.positions else "  "
+            print(f"  {in_position} {coin.replace('KRW-', '')}")
+        
+        # 새 목록 선정
+        self.logger.info("🔄 수동 종목 갱신 시작")
+        new_coins = self.coin_selector.get_top_coins(self.max_coins)
+        
+        if not new_coins:
+            print("\n❌ 새로운 종목 선정 실패")
+            self.logger.warning("종목 갱신 실패")
+            return
+        
+        new_coins_set = set(new_coins)
+        
+        # 변경사항 분석
+        added = new_coins_set - old_coins
+        removed = old_coins - new_coins_set
+        kept = old_coins & new_coins_set
+        
+        print(f"\n📊 변경 사항")
+        print(f"  유지: {len(kept)}개")
+        print(f"  추가: {len(added)}개")
+        print(f"  제외: {len(removed)}개")
+        
+        if added:
+            print(f"\n➕ 추가된 종목")
+            for coin in added:
+                print(f"   {coin.replace('KRW-', '')}")
+        
+        if removed:
+            print(f"\n➖ 제외된 종목")
+            for coin in removed:
+                has_position = "📍 포지션 유지" if coin in self.stats.positions else ""
+                print(f"   {coin.replace('KRW-', '')} {has_position}")
+        
+        # 목록 업데이트
+        self.target_coins = new_coins
+        self.last_coin_refresh = datetime.now()
+        
+        print(f"\n✅ 종목 목록 갱신 완료")
+        print(f"\n💡 안내:")
+        print(f"   - 제외된 종목의 포지션은 유지됩니다")
+        print(f"   - 매도 신호 발생 시 정상적으로 청산됩니다")
+        print(f"   - 새로운 매수는 갱신된 목록에서만 진행됩니다")
+        print("="*80 + "\n")
+        
+        self.logger.info(f"종목 갱신 완료: 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
     
     def exit_program(self):
         """프로그램 종료"""
@@ -974,6 +1097,7 @@ def print_help():
     print("  stop    - 트레이딩 정지 (모든 포지션 청산)")
     print("  status  - 현재 거래 상태 및 통계 표시")
     print("  daily   - 오늘의 거래 통계 표시")
+    print("  refresh - 종목 목록 갱신 (포지션은 유지)")
     print("  help    - 도움말 표시")
     print("  exit    - 프로그램 종료")
     print("")
@@ -1032,6 +1156,9 @@ def main():
             
             elif command == 'daily':
                 bot.daily_stats()
+            
+            elif command == 'refresh':
+                bot.refresh_coins()
             
             elif command == 'help':
                 print_help()

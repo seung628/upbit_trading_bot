@@ -336,7 +336,7 @@ python main.py
 1. @BotFather 검색
 2. /newbot 입력
 3. 봇 이름: upbit_trading_bot
-4. 사용자명: upbit_trading_bot
+4. 사용자명: t_bot
 5. 토큰 받기
 ```
 
@@ -587,4 +587,4 @@ MIT License
 
 **Happy Trading! 🚀**
 
-Made with ❤️ by QuantPilot Team
+Made with ❤️ by seung
