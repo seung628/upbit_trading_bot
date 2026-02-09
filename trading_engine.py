@@ -142,7 +142,8 @@ class TradingEngine:
         try:
             df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
             if df is None or len(df) < 50:
-                return False, [], None, 0
+                self.logger.debug(f"  {ticker} 데이터 부족")
+                return False, ["데이터부족"], None, 0
             
             df = self.calculate_indicators(df)
             
@@ -156,67 +157,101 @@ class TradingEngine:
                 ma20_old = df['ma20'].iloc[-20]
                 
                 if pd.isna(ma20_current) or pd.isna(ma20_old):
-                    return False, [], None, 0
+                    self.logger.debug(f"  {ticker} ❌ MA20 데이터 없음")
+                    return False, ["MA20없음"], None, 0
                 
                 trend_slope = (ma20_current - ma20_old) / ma20_old
                 
                 # 추세가 너무 약하면 거래 안 함 (횡보장)
                 if abs(trend_slope) < self.min_trend_strength:
-                    return False, ["횡보장"], None, 0
+                    self.logger.debug(f"  {ticker} ❌ 횡보장 (기울기 {trend_slope*100:.2f}% < {self.min_trend_strength*100}%)")
+                    return False, [f"횡보장({trend_slope*100:.2f}%)"], None, 0
             
             # 신호 수집 및 점수 계산
             signals = []
+            signal_details = []  # 상세 로그용
             total_score = 0
             
             # 신호 1: 볼린저밴드 하단 반등 (2점)
             if prev['close'] <= prev['bb_lower'] and current['close'] > current['bb_lower']:
                 signals.append("BB하단반등")
+                signal_details.append("✅ BB하단반등(2점)")
                 total_score += 2
+            else:
+                signal_details.append("❌ BB하단반등(미충족)")
             
             # 신호 2: RSI 과매도 (3점 - 강함)
             if current['rsi'] < 30:
                 signals.append(f"RSI과매도({current['rsi']:.1f})")
+                signal_details.append(f"✅ RSI강과매도(3점, {current['rsi']:.1f})")
                 total_score += 3
             elif current['rsi'] < 35:
                 signals.append(f"RSI약과매도({current['rsi']:.1f})")
+                signal_details.append(f"✅ RSI약과매도(2점, {current['rsi']:.1f})")
                 total_score += 2
+            else:
+                signal_details.append(f"❌ RSI과매도(미충족, {current['rsi']:.1f})")
             
             # 신호 3: 거래량 급증 (3점 - 강함)
             volume_ratio = current['volume'] / current['volume_ma']
             if volume_ratio > 2.0:
                 signals.append("거래량폭증")
+                signal_details.append(f"✅ 거래량폭증(3점, {volume_ratio:.1f}배)")
                 total_score += 3
             elif volume_ratio > 1.8:
                 signals.append("거래량급증")
+                signal_details.append(f"✅ 거래량급증(2점, {volume_ratio:.1f}배)")
                 total_score += 2
+            else:
+                signal_details.append(f"❌ 거래량급증(미충족, {volume_ratio:.1f}배)")
             
             # 신호 4: MACD 골든크로스 (3점 - 강함)
             if prev['macd'] <= prev['macd_signal'] and current['macd'] > current['macd_signal']:
                 signals.append("MACD골든크로스")
+                signal_details.append("✅ MACD골든크로스(3점)")
                 total_score += 3
+            else:
+                signal_details.append("❌ MACD골든크로스(미충족)")
             
             # 신호 5: 단기 이평선 상승 (1점)
             if current['ma5'] > prev['ma5'] and current['close'] > current['ma5']:
                 signals.append("MA5상승")
+                signal_details.append("✅ MA5상승(1점)")
                 total_score += 1
+            else:
+                signal_details.append("❌ MA5상승(미충족)")
             
             # 신호 6: BB 하위 위치 (2점)
             if not pd.isna(current['bb_upper']) and not pd.isna(current['bb_lower']):
                 bb_position = (current['close'] - current['bb_lower']) / (current['bb_upper'] - current['bb_lower'])
                 if bb_position < 0.25:
                     signals.append(f"BB하위({bb_position*100:.0f}%)")
+                    signal_details.append(f"✅ BB하위(2점, {bb_position*100:.0f}%)")
                     total_score += 2
+                else:
+                    signal_details.append(f"❌ BB하위(미충족, {bb_position*100:.0f}%)")
+            
+            # 로그 출력
+            if len(signals) > 0 or total_score > 0:
+                self.logger.debug(f"  {ticker} 신호 점수: {total_score}점")
+                for detail in signal_details:
+                    self.logger.debug(f"     {detail}")
             
             # 신호 점수제 사용 시
             if self.use_signal_scoring:
                 if total_score >= self.min_signal_score:
+                    self.logger.info(f"  {ticker} ✅ 매수 조건 충족! (점수: {total_score}점)")
                     return True, signals, current['close'], total_score
                 else:
+                    self.logger.debug(f"  {ticker} ❌ 점수 부족 ({total_score}점 < {self.min_signal_score}점)")
                     return False, signals, current['close'], total_score
             
             # 기존 방식 (신호 개수)
             if len(signals) >= self.min_signals:
+                self.logger.info(f"  {ticker} ✅ 매수 조건 충족! (신호: {len(signals)}개)")
                 return True, signals, current['close'], total_score
+            else:
+                self.logger.debug(f"  {ticker} ❌ 신호 부족 ({len(signals)}개 < {self.min_signals}개)")
             
             return False, signals, current['close'], total_score
             

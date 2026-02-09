@@ -15,6 +15,7 @@ from logger import TradingLogger
 from trading_stats import TradingStats
 from coin_selector import CoinSelector
 from trading_engine import TradingEngine
+from telegram_notifier import TelegramNotifier
 
 
 class TradingBot:
@@ -28,6 +29,7 @@ class TradingBot:
         self.stats = TradingStats()
         self.coin_selector = CoinSelector(self.config, self.logger)
         self.engine = TradingEngine(self.config, self.logger, self.stats)
+        self.telegram = TelegramNotifier(self.config)
         
         # 상태 변수
         self.is_running = False
@@ -36,6 +38,10 @@ class TradingBot:
         self.last_coin_refresh = None
         self.is_trading_paused = False
         self.cooldown_until = None  # 쿨다운 종료 시간
+        
+        # 중복 매수 방지
+        self.buying_in_progress = set()  # 현재 매수 중인 코인들
+        self.buy_lock = threading.Lock()  # 매수 Lock
         
         # 설정값
         self.max_coins = self.config['trading']['max_coins']
@@ -120,7 +126,81 @@ class TradingBot:
         self.trading_thread = threading.Thread(target=self._trading_loop, daemon=True)
         self.trading_thread.start()
         
+        # 매수 조건 출력
+        self._print_trading_conditions()
+        
+        # 텔레그램 알림
+        self.telegram.notify_start()
+        
+        # 텔레그램 명령어 수신 시작
+        if self.telegram.enable_commands:
+            self.telegram.start_listening(self._handle_telegram_command)
+            self.logger.info("📱 텔레그램 명령어 수신 시작")
+        
         print("✅ 트레이딩 시작됨")
+    
+    def _print_trading_conditions(self):
+        """현재 매수 조건 출력"""
+        print("\n" + "="*80)
+        print("📋 현재 매수 조건")
+        print("="*80)
+        
+        print("\n🎯 신호 점수제")
+        if self.config['indicators'].get('use_signal_scoring', False):
+            print(f"  ✅ 사용 중: 최소 {self.config['indicators']['min_signal_score']}점 필요")
+            print(f"\n  📊 신호별 점수:")
+            print(f"     거래량 폭증 (2배+)      : 3점")
+            print(f"     MACD 골든크로스          : 3점")
+            print(f"     RSI 강한 과매도 (<30)   : 3점")
+            print(f"     거래량 급증 (1.8배)     : 2점")
+            print(f"     RSI 약한 과매도 (30-35) : 2점")
+            print(f"     BB 하단 반등             : 2점")
+            print(f"     BB 하위 25%              : 2점")
+            print(f"     MA5 상승                 : 1점")
+        else:
+            print(f"  ❌ 미사용: 신호 개수 기준 ({self.config['indicators']['min_signals_required']}개 이상)")
+        
+        print("\n📈 추세 확인")
+        if self.config['indicators'].get('check_trend', False):
+            print(f"  ✅ 사용 중: MA20 기울기 {self.config['indicators']['min_trend_strength']*100}% 이상")
+            print(f"     → 횡보장 거래 금지")
+        else:
+            print(f"  ❌ 미사용")
+        
+        print("\n💰 투자 금액")
+        if self.config['trading'].get('dynamic_allocation', False):
+            print(f"  ✅ 동적 투자:")
+            print(f"     기본 금액: {self.config['trading']['buy_amount_krw']:,}원")
+            print(f"     최대 한도: {self.config['trading']['max_total_investment']:,}원")
+            print(f"     점수 11점+: 기본 × 1.5배")
+            print(f"     점수 9-10점: 기본 × 1.3배")
+            print(f"     점수 7-8점: 기본 × 1.0배")
+        else:
+            print(f"  고정 금액: {self.config['trading']['buy_amount_krw']:,}원")
+        
+        print("\n🛡️ 안전 장치")
+        print(f"  최대 스프레드: {self.config['trading'].get('max_spread_percent', 0.5)}%")
+        print(f"  최소 호가잔량: {self.config['trading'].get('min_orderbook_depth_krw', 5000000):,}원")
+        
+        print("\n⏰ 거래 시간")
+        if self.config['trading']['trading_hours'].get('enabled', False):
+            sessions = self.config['trading']['trading_hours']['sessions']
+            print(f"  ✅ 시간 필터 사용:")
+            for session in sessions:
+                print(f"     {session['start']:02d}:00 ~ {session['end']:02d}:00")
+        else:
+            print(f"  ❌ 24시간 거래")
+        
+        print("\n🎲 코인 선정")
+        print(f"  최대 동시 거래: {self.config['trading']['max_coins']}개")
+        print(f"  최소 거래량: {self.config['coin_selection']['min_volume_krw']/100000000:.0f}억원")
+        print(f"  변동성 범위: {self.config['coin_selection']['min_volatility']}% ~ {self.config['coin_selection']['max_volatility']}%")
+        
+        excluded = self.config['coin_selection'].get('excluded_coins', [])
+        if excluded:
+            print(f"  제외 코인: {', '.join(excluded)}")
+        
+        print("="*80)
     
     def stop(self):
         """트레이딩 정지"""
@@ -154,7 +234,217 @@ class TradingBot:
         # 통계 저장
         self.logger.log_daily_stats(self.stats.get_current_status())
         
+        # 텔레그램 알림
+        total_profit = final_balance - self.stats.initial_balance
+        self.telegram.notify_stop(final_balance, total_profit)
+        
+        # 텔레그램 명령어 수신 중지
+        self.telegram.stop_listening()
+        
         print("✅ 트레이딩 정지됨")
+    
+    def _handle_telegram_command(self, command):
+        """텔레그램 명령어 처리"""
+        
+        try:
+            cmd = command.strip().lower()
+            
+            # /status - 현재 상태
+            if cmd == '/status' or cmd == '/상태':
+                self._telegram_status()
+            
+            # /daily - 일일 통계
+            elif cmd == '/daily' or cmd == '/일일':
+                self._telegram_daily()
+            
+            # /positions - 포지션 현황
+            elif cmd == '/positions' or cmd == '/포지션':
+                self._telegram_positions()
+            
+            # /balance - 잔고
+            elif cmd == '/balance' or cmd == '/잔고':
+                self._telegram_balance()
+            
+            # /pause - 일시 정지
+            elif cmd == '/pause' or cmd == '/정지':
+                self._telegram_pause()
+            
+            # /resume - 재개
+            elif cmd == '/resume' or cmd == '/재개':
+                self._telegram_resume()
+            
+            # /help - 도움말
+            elif cmd == '/help' or cmd == '/도움말':
+                self._telegram_help()
+            
+            else:
+                self.telegram.send_message(
+                    f"❓ 알 수 없는 명령어: {command}\n"
+                    f"/help 를 입력하여 사용 가능한 명령어를 확인하세요."
+                )
+        
+        except Exception as e:
+            self.telegram.send_message(f"⚠️ 명령어 처리 오류: {e}")
+    
+    def _telegram_status(self):
+        """텔레그램: 상태 확인"""
+        status = self.stats.get_current_status()
+        
+        # 사용 가능 금액 계산
+        invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
+        available = min(self.max_total_investment - invested, status['current_balance'])
+        
+        state = "▶️ 실행 중" if self.is_running else "⏸️ 정지"
+        if self.is_trading_paused:
+            state += " (시간외)"
+        if self.cooldown_until:
+            state += " (쿨다운)"
+        
+        message = f"""📊 <b>현재 상태</b>
+
+🔄 상태: {state}
+
+💰 <b>자금 현황</b>
+초기: {status['initial_balance']:,.0f}원
+현재: {status['current_balance']:,.0f}원
+투자중: {invested:,.0f}원
+사용가능: {available:,.0f}원
+
+📈 <b>수익</b>
+총 평가액: {status['total_value']:,.0f}원
+총 수익률: {status['total_return']:+.2f}%
+
+📊 <b>거래 통계</b>
+총 거래: {status['total_trades']}회
+승률: {status['win_rate']:.1f}%
+"""
+        
+        self.telegram.send_message(message)
+    
+    def _telegram_daily(self):
+        """텔레그램: 일일 통계"""
+        today = datetime.now().date()
+        
+        # 파일 + 메모리 통합
+        file_trades = self.stats.load_daily_trades()
+        memory_trades = [t for t in self.stats.trades if t['timestamp'].date() == today]
+        
+        all_trades_dict = {t['timestamp'].isoformat(): t for t in file_trades}
+        for t in memory_trades:
+            all_trades_dict[t['timestamp'].isoformat()] = t
+        
+        today_trades = list(all_trades_dict.values())
+        
+        if not today_trades:
+            self.telegram.send_message("📅 오늘 거래 내역이 없습니다.")
+            return
+        
+        wins = [t for t in today_trades if t['profit_krw'] > 0]
+        losses = [t for t in today_trades if t['profit_krw'] <= 0]
+        total_profit = sum(t['profit_krw'] for t in today_trades)
+        
+        message = f"""📅 <b>일일 통계</b>
+
+날짜: {today.strftime('%Y-%m-%d')}
+
+📊 거래: {len(today_trades)}회
+✅ 승: {len(wins)}회
+❌ 패: {len(losses)}회
+📈 승률: {len(wins)/len(today_trades)*100:.1f}%
+
+💰 총 손익: {total_profit:+,.0f}원
+"""
+        
+        if wins:
+            best = max(wins, key=lambda x: x['profit_krw'])
+            message += f"\n🏆 최고: {best['coin'].replace('KRW-', '')} {best['profit_krw']:+,.0f}원"
+        
+        if losses:
+            worst = min(losses, key=lambda x: x['profit_krw'])
+            message += f"\n📉 최악: {worst['coin'].replace('KRW-', '')} {worst['profit_krw']:+,.0f}원"
+        
+        self.telegram.send_message(message)
+    
+    def _telegram_positions(self):
+        """텔레그램: 포지션 현황"""
+        if not self.stats.positions:
+            self.telegram.send_message("📭 보유 포지션이 없습니다.")
+            return
+        
+        message = "<b>📍 보유 포지션</b>\n\n"
+        
+        for ticker, pos in self.stats.positions.items():
+            coin_name = ticker.replace('KRW-', '')
+            current_price = self.engine.get_current_price(ticker)
+            
+            if current_price:
+                profit_rate = ((current_price - pos['buy_price']) / pos['buy_price']) * 100
+                profit_krw = (current_price - pos['buy_price']) * pos['amount']
+                
+                emoji = "💰" if profit_krw > 0 else "📉"
+                
+                message += f"""<b>{coin_name}</b>
+매수: {pos['buy_price']:,.0f}원
+현재: {current_price:,.0f}원
+{emoji} 수익: {profit_rate:+.2f}% ({profit_krw:+,.0f}원)
+
+"""
+        
+        self.telegram.send_message(message)
+    
+    def _telegram_balance(self):
+        """텔레그램: 잔고 확인"""
+        krw_balance = self.engine.get_balance("KRW")
+        
+        invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
+        total_value = krw_balance + invested
+        
+        message = f"""💰 <b>잔고</b>
+
+원화: {krw_balance:,.0f}원
+투자중: {invested:,.0f}원
+총 평가액: {total_value:,.0f}원
+"""
+        
+        self.telegram.send_message(message)
+    
+    def _telegram_pause(self):
+        """텔레그램: 일시 정지"""
+        if not self.is_running:
+            self.telegram.send_message("⚠️ 이미 정지 상태입니다.")
+            return
+        
+        self.is_trading_paused = True
+        self.telegram.send_message("⏸️ 거래를 일시 정지했습니다.\n/resume 으로 재개할 수 있습니다.")
+    
+    def _telegram_resume(self):
+        """텔레그램: 재개"""
+        if not self.is_running:
+            self.telegram.send_message("⚠️ 프로그램이 정지되어 있습니다.")
+            return
+        
+        self.is_trading_paused = False
+        self.cooldown_until = None
+        self.telegram.send_message("▶️ 거래를 재개했습니다.")
+    
+    def _telegram_help(self):
+        """텔레그램: 도움말"""
+        message = """📱 <b>사용 가능한 명령어</b>
+
+📊 <b>정보 조회</b>
+/status - 현재 상태
+/daily - 일일 통계
+/positions - 보유 포지션
+/balance - 잔고 확인
+
+🎮 <b>제어</b>
+/pause - 일시 정지
+/resume - 거래 재개
+
+❓ /help - 이 도움말
+"""
+        
+        self.telegram.send_message(message)
     
     def status(self):
         """현재 상태 표시"""
@@ -474,6 +764,13 @@ class TradingBot:
                     self.logger.warning(f"⛔ 일일 손실 제한 도달: {daily_profit_pct:.2f}%")
                     self.logger.warning(f"   {self.cooldown_minutes}분간 거래 중지")
                     self.cooldown_until = datetime.now() + timedelta(minutes=self.cooldown_minutes)
+                    
+                    # 텔레그램 알림
+                    self.telegram.notify_cooldown(
+                        f"일일 손실 {daily_profit_pct:.2f}% 도달",
+                        self.cooldown_minutes
+                    )
+                    
                     continue
                 
                 # 거래 시간 체크
@@ -521,6 +818,13 @@ class TradingBot:
                     
                     # 포지션 없을 때 - 매수 검토
                     if ticker not in self.stats.positions:
+                        
+                        # 중복 매수 방지: 이미 매수 중인지 확인
+                        with self.buy_lock:
+                            if ticker in self.buying_in_progress:
+                                self.logger.debug(f"  {ticker} 이미 매수 진행 중 - 건너뜀")
+                                continue
+                        
                         buy_signal, signals, current_price, signal_score = self.engine.check_buy_signal(ticker)
                         
                         if buy_signal and current_price:
@@ -538,35 +842,55 @@ class TradingBot:
                                 available_krw = self.engine.get_balance("KRW")
                                 
                                 if available_krw >= invest_amount:
-                                    # 매수 실행
-                                    buy_result = self.engine.execute_buy(ticker, invest_amount)
+                                    # 매수 시작 표시
+                                    with self.buy_lock:
+                                        self.buying_in_progress.add(ticker)
                                     
-                                    if buy_result:
-                                        # 포지션 기록 (UUID 포함)
-                                        self.stats.add_position(
-                                            ticker,
-                                            buy_result['price'],
-                                            buy_result['amount'],
-                                            buy_result.get('uuid')
-                                        )
+                                    try:
+                                        # 매수 실행
+                                        buy_result = self.engine.execute_buy(ticker, invest_amount)
                                         
-                                        # 잔고 업데이트
-                                        new_balance = self.engine.get_balance("KRW")
-                                        self.stats.update_balance(new_balance)
-                                        
-                                        # 로그 기록 (점수 포함)
-                                        signal_str = f"{', '.join(signals)} (점수:{signal_score})"
-                                        self.logger.info(f"🔵 매수 완료 | {ticker} | {invest_amount:,.0f}원 | {signal_str}")
-                                        
-                                        self.logger.log_buy(
-                                            ticker,
-                                            buy_result['price'],
-                                            buy_result['amount'],
-                                            buy_result['total_krw'],
-                                            buy_result['fee'],
-                                            signals,
-                                            new_balance
-                                        )
+                                        if buy_result:
+                                            # 포지션 기록 (UUID 포함)
+                                            self.stats.add_position(
+                                                ticker,
+                                                buy_result['price'],
+                                                buy_result['amount'],
+                                                buy_result.get('uuid')
+                                            )
+                                            
+                                            # 잔고 업데이트
+                                            new_balance = self.engine.get_balance("KRW")
+                                            self.stats.update_balance(new_balance)
+                                            
+                                            # 로그 기록 (점수 포함)
+                                            signal_str = f"{', '.join(signals)} (점수:{signal_score})"
+                                            self.logger.info(f"🔵 매수 완료 | {ticker} | {invest_amount:,.0f}원 | {signal_str}")
+                                            
+                                            # 텔레그램 알림
+                                            self.telegram.notify_buy(
+                                                ticker,
+                                                buy_result['price'],
+                                                buy_result['amount'],
+                                                invest_amount,
+                                                signals,
+                                                signal_score
+                                            )
+                                            
+                                            self.logger.log_buy(
+                                                ticker,
+                                                buy_result['price'],
+                                                buy_result['amount'],
+                                                buy_result['total_krw'],
+                                                buy_result['fee'],
+                                                signals,
+                                                new_balance
+                                            )
+                                    
+                                    finally:
+                                        # 매수 완료 (성공/실패 상관없이 제거)
+                                        with self.buy_lock:
+                                            self.buying_in_progress.discard(ticker)
                             else:
                                 self.logger.debug(f"  {ticker} 투자 한도 초과 또는 부족")
                     
@@ -602,6 +926,19 @@ class TradingBot:
                                     reason,
                                     new_balance
                                 )
+                                
+                                # 텔레그램 알림 (전량 매도 시에만)
+                                if sell_ratio >= 1.0:
+                                    holding_time = (datetime.now() - position['timestamp']).total_seconds()
+                                    self.telegram.notify_sell(
+                                        ticker,
+                                        position['buy_price'],
+                                        sell_result['price'],
+                                        profit_rate,
+                                        profit_krw,
+                                        holding_time,
+                                        reason
+                                    )
                                 
                                 # 통계 업데이트
                                 if sell_ratio >= 1.0:  # 전량 매도
