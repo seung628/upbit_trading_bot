@@ -159,6 +159,7 @@ class TradingStats:
         # 보유 포지션 평가액 계산
         position_details = []
         for coin, pos in self.positions.items():
+            total_value += pos['buy_price'] * pos['amount']
             position_details.append({
                 'coin': coin,
                 'buy_price': pos['buy_price'],
@@ -342,4 +343,3 @@ class TradingStats:
             total_profit = sum(t['profit_krw'] for t in all_trades.values())
             
             return total_profit, len(all_trades)
-

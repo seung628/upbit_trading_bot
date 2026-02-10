@@ -13,24 +13,42 @@ class TelegramNotifier:
         self.config = config.get('telegram', {})
         self.enabled = self.config.get('enabled', False)
         
+        # enabled=true인 경우 필수 정보 검증
         if self.enabled:
             self.bot_token = self.config.get('bot_token', '')
             self.chat_id = self.config.get('chat_id', '')
-            self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
             
-            # 알림 설정
-            self.notify_buy = self.config.get('notify_buy', True)
-            self.notify_sell = self.config.get('notify_sell', True)
-            self.notify_error = self.config.get('notify_error', True)
-            self.notify_daily = self.config.get('notify_daily_summary', True)
-            self.silent_mode = self.config.get('silent_mode', False)
+            # 필수 정보 누락 체크
+            if not self.bot_token or not self.chat_id:
+                print("⚠️  텔레그램 설정 불완전: bot_token 또는 chat_id 누락")
+                print("   알림 기능이 자동으로 비활성화됩니다.")
+                self.enabled = False
             
-            # 명령어 처리
-            self.enable_commands = self.config.get('enable_commands', False)
-            self.last_update_id = 0
-            self.command_thread = None
-            self.is_listening = False
-            self.command_handler = None  # 외부에서 설정
+            # 기본값 그대로인 경우
+            elif 'YOUR_BOT_TOKEN' in self.bot_token or 'YOUR_CHAT_ID' in self.chat_id:
+                print("⚠️  텔레그램 설정이 필요합니다.")
+                print("   config.json에서 bot_token과 chat_id를 설정하세요.")
+                self.enabled = False
+            
+            # 정상 설정된 경우에만 초기화
+            else:
+                self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+                
+                # 알림 설정
+                self.notify_buy_enabled = self.config.get('notify_buy', True)
+                self.notify_sell_enabled = self.config.get('notify_sell', True)
+                self.notify_error_enabled = self.config.get('notify_error', True)
+                self.notify_daily_enabled = self.config.get('notify_daily_summary', True)
+                self.silent_mode = self.config.get('silent_mode', False)
+                
+                # 명령어 처리
+                self.enable_commands = self.config.get('enable_commands', False)
+                self.last_update_id = 0
+                self.command_thread = None
+                self.is_listening = False
+                self.command_handler = None  # 외부에서 설정
+                
+                print("✅ 텔레그램 알림 활성화됨")
     
     def send_message(self, message):
         """텔레그램 메시지 전송"""
@@ -150,8 +168,11 @@ QuantPilot이 자동 매매를 시작합니다.
     
     def notify_buy(self, ticker, price, amount, invest_amount, signals, score):
         """매수 알림"""
-        if not self.enabled or not self.notify_buy:
-            return
+        if not self.enabled:
+            return False
+        
+        if not self.notify_buy_enabled:
+            return False
         
         coin_name = ticker.replace('KRW-', '')
         signals_str = ', '.join(signals[:3])  # 최대 3개만
@@ -168,13 +189,22 @@ QuantPilot이 자동 매매를 시작합니다.
 
 🕐 {datetime.now().strftime('%H:%M:%S')}
 """
-        self.send_message(message)
+        
+        success = self.send_message(message)
+        
+        if not success:
+            print(f"⚠️  텔레그램 매수 알림 전송 실패: {ticker}")
+        
+        return success
     
     def notify_sell(self, ticker, buy_price, sell_price, profit_rate, profit_krw, 
                    holding_time, reason):
         """매도 알림"""
-        if not self.enabled or not self.notify_sell:
-            return
+        if not self.enabled:
+            return False
+        
+        if not self.notify_sell_enabled:
+            return False
         
         coin_name = ticker.replace('KRW-', '')
         
@@ -209,11 +239,17 @@ QuantPilot이 자동 매매를 시작합니다.
 
 🕐 {datetime.now().strftime('%H:%M:%S')}
 """
-        self.send_message(message)
+        
+        success = self.send_message(message)
+        
+        if not success:
+            print(f"⚠️  텔레그램 매도 알림 전송 실패: {ticker}")
+        
+        return success
     
     def notify_error(self, error_type, details):
         """에러 알림"""
-        if not self.enabled or not self.notify_error:
+        if not self.enabled or not self.notify_error_enabled:
             return
         
         message = f"""⚠️ <b>오류 발생</b>
@@ -227,7 +263,7 @@ QuantPilot이 자동 매매를 시작합니다.
     
     def notify_daily_summary(self, stats):
         """일일 요약 알림"""
-        if not self.enabled or not self.notify_daily:
+        if not self.enabled or not self.notify_daily_enabled:
             return
         
         total_trades = stats.get('total_trades', 0)

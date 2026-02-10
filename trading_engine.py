@@ -516,25 +516,57 @@ class TradingEngine:
             return None
     
     def execute_sell(self, ticker, position, sell_ratio=1.0):
-        """매도 실행 - 지정가 우선, 미체결 시 시장가"""
+        """매도 실행 - 실제 잔고 기준 (locked 제외)"""
         
         try:
-            position_amount = position['amount']
+            # 실제 거래 가능 수량 확인 (locked 제외)
+            actual_balance = self.get_tradable_balance(ticker)
             
-            if position_amount <= 0:
-                self.logger.warning(f"⚠️  {ticker} 매도 가능한 수량 없음")
+            if actual_balance <= 0:
+                self.logger.warning(f"⚠️  {ticker} 매도 가능 수량 없음")
                 return None
             
-            sell_amount = position_amount * sell_ratio
+            # 포지션 수량과 비교
+            position_amount = position['amount']
+            
+            # 5% 이상 차이나면 경고 및 업데이트
+            if abs(actual_balance - position_amount) / max(position_amount, 0.00000001) > 0.05:
+                diff_pct = abs(actual_balance - position_amount) / position_amount * 100
+                self.logger.warning(
+                    f"⚠️  {ticker} 수량 불일치: "
+                    f"포지션 {position_amount:.8f} vs 실제 {actual_balance:.8f} "
+                    f"({diff_pct:.1f}% 차이)"
+                )
+                # 실제 잔고로 포지션 업데이트
+                position['amount'] = actual_balance
+            
+            # 실제 잔고 기준으로 매도 수량 계산
+            sell_amount = actual_balance * sell_ratio
+            
+            # 소수점 정밀도 조정 (99.95% 사용으로 수수료 여유 확보)
+            sell_amount = round(sell_amount * 0.9995, 8)
+            
+            if sell_amount <= 0:
+                self.logger.warning(f"⚠️  {ticker} 매도 수량 계산 오류")
+                return None
             
             current_price = pyupbit.get_current_price(ticker)
             if current_price is None:
                 return None
             
+            # 최소 주문 금액 체크 (5,500원)
             sell_value = sell_amount * current_price
-            if sell_value < 5000:
-                self.logger.warning(f"⚠️  {ticker} 매도 금액 너무 작음 ({sell_value:.0f}원)")
+            if sell_value < 5500:
+                self.logger.warning(
+                    f"⚠️  {ticker} 매도 금액 부족: {sell_value:,.0f}원 < 5,500원"
+                )
                 return None
+            
+            self.logger.info(
+                f"  💰 매도 준비: {ticker} | "
+                f"수량 {sell_amount:.8f} ({sell_ratio*100:.0f}%) | "
+                f"예상금액 {sell_value:,.0f}원"
+            )
             
             # 주문 방식 결정
             if self.order_type == 'limit_with_fallback':
@@ -614,6 +646,43 @@ class TradingEngine:
         except Exception as e:
             self.logger.log_error(f"{ticker} 현재가 조회 오류", e)
             return None
+    
+    def get_tradable_balance(self, ticker):
+        """
+        거래 가능한 실제 수량 조회 (locked 제외)
+        
+        Args:
+            ticker: 코인 티커 (예: 'KRW-BTC')
+        
+        Returns:
+            float: 매도 가능한 실제 수량 (locked 제외)
+        """
+        try:
+            coin = ticker.split('-')[1]
+            balances = self.upbit.get_balances()
+            
+            if not balances:
+                self.logger.warning(f"⚠️  {ticker} 잔고 조회 실패")
+                return 0
+            
+            for balance in balances:
+                if balance['currency'] == coin:
+                    total_balance = float(balance['balance'])
+                    locked_balance = float(balance['locked'])
+                    available = total_balance - locked_balance
+                    
+                    self.logger.debug(
+                        f"📊 {coin} 잔고 | 총:{total_balance:.8f} | "
+                        f"Locked:{locked_balance:.8f} | 가능:{available:.8f}"
+                    )
+                    
+                    return max(0, available)
+            
+            return 0
+            
+        except Exception as e:
+            self.logger.log_error(f"{ticker} 잔고 조회 오류", e)
+            return 0
     
     def emergency_sell_all(self):
         """긴급 전량 매도"""

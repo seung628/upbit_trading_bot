@@ -565,7 +565,6 @@ class TradingBot:
             for pos in status['positions']:
                 coin_name = pos['coin'].replace('KRW-', '')
                 holding_time = (datetime.now() - pos['buy_time']).total_seconds() / 60
-                current_price = self.engine.get_balance(pos['coin'])
                 
                 print(f"  {coin_name}: 매수가 {pos['buy_price']:,.0f}원 | "
                       f"수량 {pos['amount']:.8f} | 보유시간 {holding_time:.0f}분")
@@ -818,7 +817,7 @@ class TradingBot:
         return investment
     
     def _refresh_coin_list(self):
-        """코인 목록 갱신 및 이전 코인 정리"""
+        """코인 목록 갱신 (기존 포지션은 유지)"""
         
         self.logger.info("🔄 코인 목록 갱신 시작")
         
@@ -831,39 +830,12 @@ class TradingBot:
         
         old_coins = set(self.target_coins)
         new_coins_set = set(new_coins)
-        
-        # 제외된 코인 찾기 (이전에는 있었는데 새 목록에는 없는 코인)
         removed_coins = old_coins - new_coins_set
         
-        # 제외된 코인의 포지션 정리
         if removed_coins:
-            self.logger.info(f"📤 목록에서 제외된 코인 정리: {', '.join([c.replace('KRW-', '') for c in removed_coins])}")
-            
-            for coin in removed_coins:
-                if coin in self.stats.positions:
-                    position = self.stats.positions[coin]
-                    
-                    # 포지션 청산
-                    sell_result = self.engine.execute_sell(coin, position, 1.0)
-                    
-                    if sell_result:
-                        profit_krw = sell_result['total_krw'] - (position['buy_price'] * position['amount'])
-                        profit_rate = ((sell_result['price'] - position['buy_price']) / position['buy_price']) * 100
-                        
-                        self.stats.remove_position(coin, sell_result['price'], profit_krw, "목록갱신 정리")
-                        
-                        # 로그
-                        self.logger.log_sell(
-                            coin,
-                            sell_result['price'],
-                            sell_result['amount'],
-                            sell_result['total_krw'],
-                            sell_result['fee'],
-                            profit_rate,
-                            profit_krw,
-                            "목록갱신 정리",
-                            self.engine.get_balance("KRW")
-                        )
+            self.logger.info(
+                f"📌 목록 제외 코인(포지션 유지): {', '.join([c.replace('KRW-', '') for c in removed_coins])}"
+            )
         
         # 새로운 목록으로 교체
         self.target_coins = new_coins
@@ -953,12 +925,28 @@ class TradingBot:
                     # 포지션 없을 때 - 매수 검토
                     if ticker not in self.stats.positions:
                         
-                        # 중복 매수 방지: 이미 매수 중인지 확인
+                        # 중복 매수 방지 1차 체크
                         with self.buy_lock:
+                            # 1단계: 매수 진행 중 체크
                             if ticker in self.buying_in_progress:
                                 self.logger.debug(f"  {ticker} 이미 매수 진행 중 - 건너뜀")
                                 continue
+                            
+                            # 2단계: 포지션 재확인 (Race Condition 방지)
+                            if ticker in self.stats.positions:
+                                self.logger.debug(f"  {ticker} 이미 포지션 보유 중 - 건너뜀")
+                                continue
+                            
+                            # 3단계: 실제 잔고 확인 (유령 포지션 방지)
+                            coin = ticker.split('-')[1]
+                            actual_balance = self.engine.upbit.get_balance(coin)
+                            if actual_balance > 0:
+                                self.logger.warning(
+                                    f"  ⚠️  {ticker} 실제 잔고 존재 ({actual_balance:.8f}), 매수 취소"
+                                )
+                                continue
                         
+                        # 매수 신호 확인
                         buy_signal, signals, current_price, signal_score = self.engine.check_buy_signal(ticker)
                         
                         if buy_signal and current_price:
@@ -976,15 +964,21 @@ class TradingBot:
                                 available_krw = self.engine.get_balance("KRW")
                                 
                                 if available_krw >= invest_amount:
-                                    # 매수 시작 표시
+                                    # 매수 진행 표시 (실제 매수 직전)
                                     with self.buy_lock:
+                                        # 최종 재확인 (다른 스레드에서 이미 매수했을 수 있음)
+                                        if ticker in self.buying_in_progress or ticker in self.stats.positions:
+                                            self.logger.debug(f"  {ticker} 최종 체크 실패 - 건너뜀")
+                                            continue
+                                        
                                         self.buying_in_progress.add(ticker)
                                     
                                     try:
                                         # 매수 실행
                                         buy_result = self.engine.execute_buy(ticker, invest_amount)
                                         
-                                        if buy_result:
+                                        # 성공한 경우에만 기록
+                                        if buy_result and 'price' in buy_result and 'amount' in buy_result:
                                             # 포지션 기록 (UUID 포함)
                                             self.stats.add_position(
                                                 ticker,
@@ -1001,8 +995,8 @@ class TradingBot:
                                             signal_str = f"{', '.join(signals)} (점수:{signal_score})"
                                             self.logger.info(f"🔵 매수 완료 | {ticker} | {invest_amount:,.0f}원 | {signal_str}")
                                             
-                                            # 텔레그램 알림
-                                            self.telegram.notify_buy(
+                                            # 텔레그램 알림 (실패 로깅)
+                                            success = self.telegram.notify_buy(
                                                 ticker,
                                                 buy_result['price'],
                                                 buy_result['amount'],
@@ -1010,6 +1004,9 @@ class TradingBot:
                                                 signals,
                                                 signal_score
                                             )
+                                            
+                                            if not success:
+                                                self.logger.debug(f"  ⚠️  {ticker} 텔레그램 알림 전송 실패")
                                             
                                             self.logger.log_buy(
                                                 ticker,
@@ -1020,6 +1017,9 @@ class TradingBot:
                                                 signals,
                                                 new_balance
                                             )
+                                        else:
+                                            # 매수 실패
+                                            self.logger.warning(f"⚠️  {ticker} 매수 실패")
                                     
                                     finally:
                                         # 매수 완료 (성공/실패 상관없이 제거)
@@ -1035,11 +1035,12 @@ class TradingBot:
                         should_sell, reason, sell_ratio = self.engine.check_sell_signal(ticker, position)
                         
                         if should_sell:
-                            # 매도 실행 (포지션 정보 전달)
+                            # 매도 실행 (실제 잔고 기준, locked 자동 제외)
                             sell_result = self.engine.execute_sell(ticker, position, sell_ratio)
                             
-                            if sell_result:
-                                # 수익 계산
+                            # 성공한 경우에만 처리
+                            if sell_result and 'price' in sell_result and 'amount' in sell_result:
+                                # 수익 계산 (실제 매도 수량 기준)
                                 buy_cost = position['buy_price'] * sell_result['amount']
                                 profit_krw = sell_result['total_krw'] - buy_cost
                                 profit_rate = ((sell_result['price'] - position['buy_price']) / position['buy_price']) * 100
@@ -1061,10 +1062,13 @@ class TradingBot:
                                     new_balance
                                 )
                                 
-                                # 텔레그램 알림 (전량 매도 시에만)
-                                if sell_ratio >= 1.0:
+                                # 통계 업데이트
+                                if sell_ratio >= 1.0:  # 전량 매도
+                                    self.stats.remove_position(ticker, sell_result['price'], profit_krw, reason)
+                                    
+                                    # 전량 매도 시에만 텔레그램 알림
                                     holding_time = (datetime.now() - position['timestamp']).total_seconds()
-                                    self.telegram.notify_sell(
+                                    success = self.telegram.notify_sell(
                                         ticker,
                                         position['buy_price'],
                                         sell_result['price'],
@@ -1073,21 +1077,44 @@ class TradingBot:
                                         holding_time,
                                         reason
                                     )
+                                    
+                                    if not success:
+                                        self.logger.debug(f"  ⚠️  {ticker} 텔레그램 알림 전송 실패")
+                                    
+                                    self.logger.info(
+                                        f"🔴 매도 완료 | {ticker} | "
+                                        f"수익률 {profit_rate:+.2f}% | 손익 {profit_krw:+,.0f}원 | "
+                                        f"{reason}"
+                                    )
                                 
-                                # 통계 업데이트
-                                if sell_ratio >= 1.0:  # 전량 매도
-                                    self.stats.remove_position(ticker, sell_result['price'], profit_krw, reason)
                                 else:  # 분할 매도
                                     # 포지션 수량 감소
                                     position['amount'] -= sell_result['amount']
                                     
+                                    # 스냅샷 즉시 업데이트 (중요!)
+                                    self.stats.save_positions()
+                                    
+                                    self.logger.info(
+                                        f"  ✅ 분할 매도: {sell_ratio*100:.0f}% | "
+                                        f"매도수량 {sell_result['amount']:.8f} | "
+                                        f"남은수량 {position['amount']:.8f} | "
+                                        f"수익 {profit_krw:+,.0f}원"
+                                    )
+                                    
                                     # 남은 수량이 너무 작으면 전량 청산
-                                    if position['amount'] * sell_result['price'] < 5000:
-                                        self.logger.info(f"  잔여 수량 소액으로 전량 청산: {ticker}")
+                                    current_price = self.engine.get_current_price(ticker)
+                                    if current_price and (position['amount'] * current_price < 5500):
+                                        self.logger.info(f"  💸 잔여 수량 소액으로 전량 청산: {ticker}")
                                         final_sell = self.engine.execute_sell(ticker, position, 1.0)
+                                        
                                         if final_sell:
                                             final_profit = final_sell['total_krw'] - (position['buy_price'] * position['amount'])
                                             self.stats.remove_position(ticker, final_sell['price'], final_profit, "소액청산")
+                                            
+                                            self.logger.info(
+                                                f"  ✅ 소액청산 완료: {ticker} | "
+                                                f"{final_profit:+,.0f}원"
+                                            )
                 
                 # 대기
                 time.sleep(self.check_interval)
