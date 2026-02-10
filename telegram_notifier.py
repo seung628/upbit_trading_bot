@@ -128,7 +128,7 @@ class TelegramNotifier:
 
 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-upbit_trading_bot이 자동 매매를 시작합니다.
+QuantPilot이 자동 매매를 시작합니다.
 """
         self.send_message(message)
     

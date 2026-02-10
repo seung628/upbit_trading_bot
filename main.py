@@ -92,26 +92,37 @@ class TradingBot:
             self.logger.info(f"💾 저장된 포지션 발견: {len(saved_positions)}개")
             
             # 계정 잔고와 대조 (Reconcile)
-            reconcile_ok = True
+            reconciled_positions = {}
+            
             for coin, saved_pos in saved_positions.items():
                 actual_balance = self.engine.upbit.get_balance(coin)
                 saved_amount = saved_pos['amount']
                 
-                # 차이가 1% 이상이면 경고
+                # 실제 잔고가 없으면 포지션 제거
+                if actual_balance <= 0 and saved_amount > 0:
+                    self.logger.warning(f"⚠️  {coin} 포지션은 있으나 실제 잔고 없음 → 스냅샷에서 제거")
+                    continue  # 복구하지 않음
+                
+                # 실제 잔고가 있으면 차이 확인
                 if actual_balance > 0:
-                    diff_pct = abs(actual_balance - saved_amount) / saved_amount * 100
-                    if diff_pct > 1.0:
-                        self.logger.warning(f"⚠️  {coin} 수량 불일치: 저장 {saved_amount:.8f} vs 실제 {actual_balance:.8f}")
-                        reconcile_ok = False
-                elif saved_amount > 0:
-                    self.logger.warning(f"⚠️  {coin} 포지션은 있으나 실제 잔고 없음")
-                    reconcile_ok = False
+                    diff_pct = abs(actual_balance - saved_amount) / saved_amount * 100 if saved_amount > 0 else 100
+                    
+                    if diff_pct > 5.0:  # 5% 이상 차이
+                        self.logger.warning(f"⚠️  {coin} 수량 불일치: 저장 {saved_amount:.8f} vs 실제 {actual_balance:.8f} ({diff_pct:.1f}%)")
+                        # 실제 잔고로 업데이트
+                        saved_pos['amount'] = actual_balance
+                        self.logger.info(f"   → 실제 잔고로 업데이트: {actual_balance:.8f}")
+                    
+                    reconciled_positions[coin] = saved_pos
             
-            if reconcile_ok:
-                self.stats.positions = saved_positions
-                self.logger.info(f"✅ 포지션 복구 완료")
+            if reconciled_positions:
+                self.stats.positions = reconciled_positions
+                self.logger.info(f"✅ 포지션 복구 완료: {len(reconciled_positions)}개")
+                
+                # 스냅샷 업데이트 (정리된 포지션으로)
+                self.stats.save_positions()
             else:
-                self.logger.error("❌ 포지션 불일치 감지! 저장된 포지션 무시")
+                self.logger.info("📝 복구할 포지션이 없습니다")
         
         # 코인 선정
         self.target_coins = self.coin_selector.get_top_coins(self.max_coins)

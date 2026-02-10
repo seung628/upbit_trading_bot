@@ -379,8 +379,13 @@ class TradingEngine:
                             
                             # 완전 체결
                             if order_info['state'] == 'done':
-                                avg_price = float(order_info['avg_buy_price'])
+                                avg_price = float(order_info.get('avg_buy_price', 0))
                                 paid_fee = float(order_info.get('paid_fee', 0))
+                                
+                                # avg_buy_price가 없거나 0이면 bid_price 사용
+                                if avg_price == 0:
+                                    avg_price = bid_price
+                                    self.logger.warning(f"  ⚠️  avg_buy_price 없음, bid_price 사용: {avg_price:,.0f}원")
                                 
                                 self.logger.info(f"  ✅ 지정가 완전체결: {avg_price:,.0f}원 × {executed_volume:.8f}")
                                 
@@ -436,8 +441,11 @@ class TradingEngine:
                                 
                                 # 남은 금액이 적으면 부분체결만으로 종료
                                 else:
-                                    avg_price = float(order_info['avg_buy_price'])
+                                    avg_price = float(order_info.get('avg_buy_price', bid_price))
                                     paid_fee = float(order_info.get('paid_fee', 0))
+                                    
+                                    if avg_price == 0:
+                                        avg_price = bid_price
                                     
                                     self.logger.info(f"  ✅ 부분체결로 종료: {avg_price:,.0f}원")
                                     
@@ -469,8 +477,13 @@ class TradingEngine:
                 order_info = self.upbit.get_order(result['uuid'])
                 if order_info:
                     executed_volume = float(order_info.get('executed_volume', 0))
-                    avg_price = float(order_info.get('avg_buy_price', current_price))
+                    avg_price = float(order_info.get('avg_buy_price', 0))
                     paid_fee = float(order_info.get('paid_fee', 0))
+                    
+                    # avg_buy_price가 없거나 0이면 current_price 사용
+                    if avg_price == 0:
+                        avg_price = current_price
+                        self.logger.warning(f"  ⚠️  avg_buy_price 없음, current_price 사용: {avg_price:,.0f}원")
                     
                     return {
                         'price': avg_price,
@@ -593,6 +606,14 @@ class TradingEngine:
         except Exception as e:
             self.logger.log_error("잔고 조회 오류", e)
             return 0
+    
+    def get_current_price(self, ticker):
+        """현재가 조회"""
+        try:
+            return pyupbit.get_current_price(ticker)
+        except Exception as e:
+            self.logger.log_error(f"{ticker} 현재가 조회 오류", e)
+            return None
     
     def emergency_sell_all(self):
         """긴급 전량 매도"""
