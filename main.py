@@ -50,6 +50,7 @@ class TradingBot:
         self.dynamic_allocation = self.config['trading'].get('dynamic_allocation', False)
         self.check_interval = self.config['trading']['check_interval_seconds']
         self.refresh_interval_hours = self.config['coin_selection'].get('refresh_interval_hours', 1)
+        self.empty_list_retry_seconds = self.config['coin_selection'].get('empty_list_retry_seconds', 60)
         
         # 일일 손실 제한
         self.daily_loss_limit = self.config['trading'].get('daily_loss_limit_percent', -5.0)
@@ -58,6 +59,15 @@ class TradingBot:
         # 거래 시간 필터
         self.trading_hours_enabled = self.config['trading']['trading_hours'].get('enabled', False)
         self.trading_sessions = self.config['trading']['trading_hours'].get('sessions', [])
+        
+        # 미기록 잔고 처리 설정
+        untracked_cfg = self.config['trading'].get('untracked_balance', {})
+        self.untracked_action = str(untracked_cfg.get('action', 'ignore')).lower()
+        self.untracked_cleanup_max_krw = untracked_cfg.get('cleanup_max_krw', 20000)
+        
+        # 보호 종목은 excluded_coins 단일 목록으로 통일
+        excluded = set(self.config['coin_selection'].get('excluded_coins', []))
+        self.protected_coins = {self._to_symbol(c) for c in excluded if c}
     
     def start(self):
         """트레이딩 시작"""
@@ -124,13 +134,14 @@ class TradingBot:
             else:
                 self.logger.info("📝 복구할 포지션이 없습니다")
         
+        # 스냅샷에 없는 실제 잔고 처리
+        self._sync_untracked_balances()
+        
         # 코인 선정
         self.target_coins = self.coin_selector.get_top_coins(self.max_coins)
         self.last_coin_refresh = datetime.now()
-        
         if not self.target_coins:
-            print("❌ 거래 가능한 코인이 없습니다.")
-            return
+            self.logger.warning("⚠️ 거래 가능한 코인이 없습니다. 대기 상태로 시작 후 주기적으로 재조회합니다.")
         
         # 거래 시작
         self.is_running = True
@@ -148,10 +159,14 @@ class TradingBot:
             self.telegram.start_listening(self._handle_telegram_command)
             self.logger.info("📱 텔레그램 명령어 수신 시작")
         
-        print("✅ 트레이딩 시작됨")
+        if self.target_coins:
+            print("✅ 트레이딩 시작됨")
+        else:
+            print("✅ 트레이딩 대기 시작됨 (거래 가능 종목 자동 탐색 중)")
     
     def _print_trading_conditions(self):
         """현재 매수 조건 출력"""
+        
         print("\n" + "="*80)
         print("📋 현재 매수 조건")
         print("="*80)
@@ -211,7 +226,126 @@ class TradingBot:
         if excluded:
             print(f"  제외 코인: {', '.join(excluded)}")
         
+        if self.protected_coins:
+            print(f"  보호 종목(미개입): {', '.join(sorted(self.protected_coins))}")
+        
         print("="*80)
+    
+    def _to_symbol(self, ticker_or_symbol):
+        """티커/심볼을 심볼(예: BTC)로 표준화"""
+        if not ticker_or_symbol:
+            return ""
+        
+        value = str(ticker_or_symbol).upper()
+        if '-' in value:
+            return value.split('-')[-1]
+        return value
+    
+    def _is_protected_coin(self, ticker_or_symbol):
+        """예외 종목(수동 관리) 여부 확인"""
+        symbol = self._to_symbol(ticker_or_symbol)
+        return symbol in self.protected_coins
+    
+    def _sync_untracked_balances(self):
+        """스냅샷에 없는 실제 잔고를 설정에 따라 편입/정리"""
+        try:
+            balances = self.engine.upbit.get_balances()
+            if not balances:
+                return
+            
+            for bal in balances:
+                currency = bal.get('currency')
+                if not currency or currency == "KRW":
+                    continue
+                
+                amount = float(bal.get('balance', 0) or 0)
+                if amount <= 0:
+                    continue
+                
+                ticker = f"KRW-{currency}"
+                
+                # 이미 포지션이면 스킵
+                if ticker in self.stats.positions:
+                    continue
+                
+                # 보호 종목이면 미개입
+                if self._is_protected_coin(currency):
+                    self.logger.info(f"🛡️ 보호 종목 잔고 감지(미개입): {ticker} {amount:.8f}")
+                    continue
+                
+                self._handle_untracked_balance(ticker, amount, is_startup=True)
+        
+        except Exception as e:
+            self.logger.log_error("미기록 잔고 동기화 오류", e)
+    
+    def _handle_untracked_balance(self, ticker, actual_balance, is_startup=False):
+        """
+        스냅샷에 없는 실제 잔고 처리.
+        Returns:
+            bool: 처리/스킵 완료 여부 (True면 추가 매수 검토 중단)
+        """
+        # 보호 종목은 무조건 미개입
+        if self._is_protected_coin(ticker):
+            if is_startup:
+                self.logger.info(f"🛡️ 보호 종목이므로 미기록 잔고 처리 제외: {ticker}")
+            return True
+        
+        action = self.untracked_action
+        
+        # 1) 편입 모드: 봇 포지션으로 편입
+        if action == "attach":
+            if ticker not in self.stats.positions:
+                coin = ticker.split('-')[1]
+                buy_price = self.engine.upbit.get_avg_buy_price(coin)
+                
+                if not buy_price or buy_price <= 0:
+                    market_price = self.engine.get_current_price(ticker)
+                    buy_price = market_price if market_price and market_price > 0 else 0
+                
+                if buy_price and buy_price > 0:
+                    self.stats.add_position(ticker, buy_price, actual_balance, "external-balance")
+                    self.logger.warning(
+                        f"📥 미기록 잔고 편입: {ticker} | 수량 {actual_balance:.8f} | 기준가 {buy_price:,.0f}"
+                    )
+                else:
+                    self.logger.warning(f"⚠️ {ticker} 미기록 잔고 편입 실패: 기준가 조회 불가")
+            return True
+        
+        # 2) 소액 정리 모드: 지정 금액 이하만 자동 정리
+        if action == "cleanup_small":
+            current_price = self.engine.get_current_price(ticker)
+            if not current_price:
+                self.logger.warning(f"⚠️ {ticker} 현재가 조회 실패로 소액 정리 보류")
+                return True
+            
+            est_krw = actual_balance * current_price
+            min_trade = self.config['trading']['min_trade_amount']
+            
+            if est_krw < min_trade:
+                self.logger.info(f"💤 {ticker} 잔고 소액({est_krw:,.0f}원)으로 정리 불가, 보류")
+                return True
+            
+            if est_krw <= self.untracked_cleanup_max_krw:
+                temp_position = {
+                    'buy_price': current_price,
+                    'amount': actual_balance,
+                    'timestamp': datetime.now(),
+                    'highest_price': current_price
+                }
+                sell_result = self.engine.execute_sell(ticker, temp_position, 1.0)
+                if sell_result:
+                    self.logger.warning(f"🧹 미기록 소액 잔고 정리 완료: {ticker} | 약 {est_krw:,.0f}원")
+                else:
+                    self.logger.warning(f"⚠️ {ticker} 미기록 소액 잔고 정리 실패")
+                return True
+            
+            self.logger.info(
+                f"📌 {ticker} 미기록 잔고 유지: {est_krw:,.0f}원 > 정리한도 {self.untracked_cleanup_max_krw:,.0f}원"
+            )
+            return True
+        
+        # 3) 기본 모드(ignore): 기존 동작 유지
+        return False
     
     def stop(self):
         """트레이딩 정지"""
@@ -235,7 +369,26 @@ class TradingBot:
                 sell_result = self.engine.execute_sell(coin, position, 1.0)
                 
                 if sell_result:
-                    profit_krw = sell_result['total_krw'] - (position['buy_price'] * position['amount'])
+                    remaining_amount = sell_result.get('remaining_amount')
+                    if remaining_amount is None:
+                        remaining_amount = self.engine.get_tradable_balance(coin)
+                    
+                    min_trade = self.config['trading']['min_trade_amount']
+                    ref_price = self.engine.get_current_price(coin) or sell_result['price']
+                    remaining_value = remaining_amount * ref_price if ref_price else 0
+                    
+                    # 전량 청산 시에도 잔량이 주문 가능하면 포지션 유지
+                    if remaining_amount > 0 and remaining_value >= min_trade:
+                        position['amount'] = remaining_amount
+                        self.stats.save_positions()
+                        self.logger.warning(
+                            f"⚠️ 정지 청산 후 잔량 남음: {coin} | "
+                            f"{remaining_amount:.8f} ({remaining_value:,.0f}원) | 포지션 유지"
+                        )
+                        continue
+                    
+                    sold_cost = position['buy_price'] * sell_result['amount']
+                    profit_krw = sell_result['total_krw'] - sold_cost
                     self.stats.remove_position(coin, sell_result['price'], profit_krw, "정지시 청산")
         
         # 최종 잔고
@@ -246,8 +399,9 @@ class TradingBot:
         self.logger.log_daily_stats(self.stats.get_current_status())
         
         # 텔레그램 알림
-        total_profit = final_balance - self.stats.initial_balance
-        self.telegram.notify_stop(final_balance, total_profit)
+        final_status = self.stats.get_current_status()
+        total_profit = final_status['total_value'] - self.stats.initial_balance
+        self.telegram.notify_stop(final_status['total_value'], total_profit)
         
         # 텔레그램 명령어 수신 중지
         self.telegram.stop_listening()
@@ -919,6 +1073,18 @@ class TradingBot:
                     if elapsed_hours >= self.refresh_interval_hours:
                         self._refresh_coin_list()
                 
+                # 거래 대상이 비어있으면 짧은 주기로 재조회
+                if not self.target_coins:
+                    elapsed_sec = (datetime.now() - self.last_coin_refresh).total_seconds() if self.last_coin_refresh else 999999
+                    if elapsed_sec >= self.empty_list_retry_seconds:
+                        self.logger.info(
+                            f"🔁 거래 가능 종목 재탐색 중... (주기 {self.empty_list_retry_seconds}초)"
+                        )
+                        self._refresh_coin_list()
+                    
+                    time.sleep(min(self.check_interval, self.empty_list_retry_seconds))
+                    continue
+                
                 # 각 코인별로 매매 체크
                 for ticker in self.target_coins:
                     
@@ -941,6 +1107,24 @@ class TradingBot:
                             coin = ticker.split('-')[1]
                             actual_balance = self.engine.upbit.get_balance(coin)
                             if actual_balance > 0:
+                                # 최소 주문금액 미만의 잔고(dust)는 매수 차단에서 제외
+                                current_price = self.engine.get_current_price(ticker)
+                                if current_price:
+                                    balance_value = actual_balance * current_price
+                                    min_trade = self.config['trading']['min_trade_amount']
+                                    
+                                    if balance_value < min_trade:
+                                        self.logger.debug(
+                                            f"  {ticker} 소액 잔고 무시: {actual_balance:.8f} "
+                                            f"({balance_value:,.0f}원 < {min_trade:,.0f}원)"
+                                        )
+                                        actual_balance = 0
+                                
+                            if actual_balance > 0:
+                                handled = self._handle_untracked_balance(ticker, actual_balance, is_startup=False)
+                                if handled:
+                                    continue
+                                
                                 self.logger.warning(
                                     f"  ⚠️  {ticker} 실제 잔고 존재 ({actual_balance:.8f}), 매수 취소"
                                 )
@@ -1064,6 +1248,31 @@ class TradingBot:
                                 
                                 # 통계 업데이트
                                 if sell_ratio >= 1.0:  # 전량 매도
+                                    remaining_amount = sell_result.get('remaining_amount')
+                                    if remaining_amount is None:
+                                        remaining_amount = self.engine.get_tradable_balance(ticker)
+                                    
+                                    min_trade = self.config['trading']['min_trade_amount']
+                                    ref_price = self.engine.get_current_price(ticker) or sell_result['price']
+                                    remaining_value = remaining_amount * ref_price if ref_price else 0
+                                    
+                                    # 주문 가능 금액 이상의 잔량이 남으면 포지션 유지
+                                    if remaining_amount > 0 and remaining_value >= min_trade:
+                                        position['amount'] = remaining_amount
+                                        self.stats.save_positions()
+                                        self.logger.warning(
+                                            f"⚠️ 전량 매도 후 잔량 남음: {ticker} | "
+                                            f"{remaining_amount:.8f} ({remaining_value:,.0f}원) | 포지션 유지"
+                                        )
+                                        continue
+                                    
+                                    # 최소 주문금액 미만 잔량은 dust로 간주하고 포지션 종료
+                                    if remaining_amount > 0:
+                                        self.logger.info(
+                                            f"💤 전량 매도 후 소액 잔량(dust): {ticker} | "
+                                            f"{remaining_amount:.8f} ({remaining_value:,.0f}원)"
+                                        )
+                                    
                                     self.stats.remove_position(ticker, sell_result['price'], profit_krw, reason)
                                     
                                     # 전량 매도 시에만 텔레그램 알림

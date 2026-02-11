@@ -3,9 +3,11 @@
 """
 
 import pyupbit
+import pyupbit.request_api as request_api
 import pandas as pd
 import numpy as np
 import time
+import re
 from datetime import datetime
 
 
@@ -52,6 +54,44 @@ class TradingEngine:
         # 안전 장치
         self.max_spread_pct = config['trading'].get('max_spread_percent', 0.5)
         self.min_orderbook_depth = config['trading'].get('min_orderbook_depth_krw', 5000000)
+        
+        # pyupbit Remaining-Req 파싱 오류 우회 패치
+        self._patch_pyupbit_remaining_req_parser()
+    
+    def _patch_pyupbit_remaining_req_parser(self):
+        """Remaining-Req 헤더 파싱 실패로 인한 예외를 완화"""
+        try:
+            # 이미 패치된 경우 중복 방지
+            if getattr(request_api, "_patched_remaining_req_parser", False):
+                return
+            
+            original_parse = request_api._parse
+            
+            def safe_parse(remaining_req):
+                # 정상 케이스는 원래 파서 사용
+                try:
+                    return original_parse(remaining_req)
+                except Exception:
+                    pass
+                
+                # 변형 헤더 대응 (대소문자/공백/순서 유연 처리)
+                text = str(remaining_req or "")
+                group_match = re.search(r"group\s*=\s*([a-zA-Z\-]+)", text)
+                min_match = re.search(r"min\s*=\s*([0-9]+)", text)
+                sec_match = re.search(r"sec\s*=\s*([0-9]+)", text)
+                
+                return {
+                    "group": group_match.group(1).lower() if group_match else "unknown",
+                    "min": int(min_match.group(1)) if min_match else 0,
+                    "sec": int(sec_match.group(1)) if sec_match else 0,
+                }
+            
+            request_api._parse = safe_parse
+            request_api._patched_remaining_req_parser = True
+            self.logger.info("✅ pyupbit Remaining-Req 파서 안전 패치 적용")
+        
+        except Exception as e:
+            self.logger.warning(f"⚠️ pyupbit 파서 패치 실패: {e}")
     
     def check_orderbook_safety(self, ticker):
         """호가창 안전성 체크 (스프레드, 호가잔량)"""
@@ -89,10 +129,52 @@ class TradingEngine:
     def connect(self, access_key, secret_key):
         """업비트 API 연결"""
         try:
+            # 기본 키 형식 검증
+            if not access_key or not secret_key:
+                self.logger.error("업비트 API 연결 실패: access_key 또는 secret_key 누락")
+                return False
+            if access_key.startswith("YOUR_") or secret_key.startswith("YOUR_"):
+                self.logger.error("업비트 API 연결 실패: 플레이스홀더 키가 설정되어 있습니다")
+                return False
+            if len(access_key) != 40 or len(secret_key) != 40:
+                self.logger.warning(
+                    f"업비트 API 키 길이 비정상 가능성: access({len(access_key)}), secret({len(secret_key)})"
+                )
+
             self.upbit = pyupbit.Upbit(access_key, secret_key)
-            balance = self.upbit.get_balance("KRW")
-            self.logger.info(f"✅ 업비트 API 연결 성공 | 보유 현금: {balance:,.0f}원")
-            return True
+            
+            # RemainingReqParsingError 등 일시 오류 우회용 재시도
+            last_error = None
+            for attempt in range(1, 6):
+                try:
+                    balance = self.upbit.get_balance("KRW")
+                    
+                    if balance is None:
+                        last_error = "KRW 잔고 조회 결과가 None"
+                        time.sleep(0.7)
+                        continue
+                    
+                    balance = float(balance)
+                    self.logger.info(f"✅ 업비트 API 연결 성공 | 보유 현금: {balance:,.0f}원")
+                    return True
+                
+                except Exception as e:
+                    last_error = f"{type(e).__name__}: {e}"
+                    self.logger.warning(f"API 연결 재시도 {attempt}/5 실패 - {last_error}")
+                    time.sleep(0.7)
+            
+            # 마지막 진단
+            diag = None
+            try:
+                diag = self.upbit.get_balances()
+            except Exception as diag_e:
+                diag = f"get_balances 예외: {type(diag_e).__name__}: {diag_e}"
+            
+            self.logger.error(
+                "업비트 API 연결 실패: KRW 잔고 조회 실패. "
+                f"last_error={last_error} | 진단 get_balances={diag}"
+            )
+            return False
         except Exception as e:
             self.logger.log_error("업비트 API 연결 실패", e)
             return False
@@ -541,10 +623,12 @@ class TradingEngine:
                 position['amount'] = actual_balance
             
             # 실제 잔고 기준으로 매도 수량 계산
-            sell_amount = actual_balance * sell_ratio
-            
-            # 소수점 정밀도 조정 (99.95% 사용으로 수수료 여유 확보)
-            sell_amount = round(sell_amount * 0.9995, 8)
+            full_liquidation = sell_ratio >= 0.999
+            if full_liquidation:
+                # 전량 매도는 가용 수량 전체를 주문하여 잔량 최소화
+                sell_amount = round(actual_balance, 8)
+            else:
+                sell_amount = round(actual_balance * sell_ratio, 8)
             
             if sell_amount <= 0:
                 self.logger.warning(f"⚠️  {ticker} 매도 수량 계산 오류")
@@ -595,11 +679,13 @@ class TradingEngine:
                             
                             self.logger.info(f"  ✅ 지정가 체결: {ask_price:,.0f}원")
                             
+                            remaining_balance = self.get_tradable_balance(ticker)
                             return {
                                 'price': ask_price,
                                 'amount': sell_amount,
                                 'total_krw': total_krw * (1 - self.FEE / 2),
-                                'fee': fee
+                                'fee': fee,
+                                'remaining_amount': remaining_balance
                             }
                         
                         else:
@@ -616,15 +702,44 @@ class TradingEngine:
                 return None
             
             time.sleep(0.5)
+
+            # UUID로 체결 정보 조회 (정확한 체결가/수수료 반영)
+            if 'uuid' in result:
+                order_info = self.upbit.get_order(result['uuid'])
+                if order_info:
+                    executed_volume = float(order_info.get('executed_volume', 0))
+                    avg_price = float(order_info.get('avg_sell_price', 0))
+                    paid_fee = float(order_info.get('paid_fee', 0))
+
+                    if executed_volume > 0:
+                        if avg_price == 0:
+                            avg_price = current_price
+                            self.logger.warning(
+                                f"  ⚠️  avg_sell_price 없음, current_price 사용: {avg_price:,.0f}원"
+                            )
+                        
+                        gross_krw = executed_volume * avg_price
+                        net_krw = gross_krw - paid_fee if paid_fee > 0 else gross_krw * (1 - self.FEE)
+                        fee = paid_fee if paid_fee > 0 else gross_krw * self.FEE
+                        remaining_balance = self.get_tradable_balance(ticker)
+                        return {
+                            'price': avg_price,
+                            'amount': executed_volume,
+                            'total_krw': net_krw,
+                            'fee': fee,
+                            'remaining_amount': remaining_balance
+                        }
             
+            # 체결 정보 조회 실패 시 폴백
             total_krw = sell_amount * current_price
             fee = total_krw * self.FEE
-            
+            remaining_balance = self.get_tradable_balance(ticker)
             return {
                 'price': current_price,
                 'amount': sell_amount,
                 'total_krw': total_krw * (1 - self.FEE),
-                'fee': fee
+                'fee': fee,
+                'remaining_amount': remaining_balance
             }
             
         except Exception as e:

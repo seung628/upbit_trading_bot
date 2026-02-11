@@ -171,3 +171,7 @@ class TradingLogger:
     def debug(self, message):
         """디버그 로그"""
         self.logger.debug(message)
+    
+    def error(self, message):
+        """에러 로그"""
+        self.logger.error(message)

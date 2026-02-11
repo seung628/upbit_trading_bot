@@ -7,6 +7,7 @@ from collections import defaultdict
 import json
 import os
 import threading
+import pyupbit
 
 
 class TradingStats:
@@ -138,70 +139,76 @@ class TradingStats:
     
     def update_balance(self, current_balance):
         """잔고 업데이트 및 MDD 계산"""
-        self.current_balance = current_balance
-        
-        # 최고점 갱신
-        if current_balance > self.peak_balance:
-            self.peak_balance = current_balance
-        
-        # MDD 계산
-        if self.peak_balance > 0:
-            drawdown = ((current_balance - self.peak_balance) / self.peak_balance) * 100
-            if drawdown < self.max_drawdown:
-                self.max_drawdown = drawdown
-        
-        self.last_update = datetime.now()
+        with self.lock:
+            self.current_balance = current_balance
+            
+            # 최고점 갱신
+            if current_balance > self.peak_balance:
+                self.peak_balance = current_balance
+            
+            # MDD 계산
+            if self.peak_balance > 0:
+                drawdown = ((current_balance - self.peak_balance) / self.peak_balance) * 100
+                if drawdown < self.max_drawdown:
+                    self.max_drawdown = drawdown
+            
+            self.last_update = datetime.now()
     
     def get_current_status(self):
         """현재 상태 조회"""
-        total_value = self.current_balance
-        
-        # 보유 포지션 평가액 계산
-        position_details = []
-        for coin, pos in self.positions.items():
-            total_value += pos['buy_price'] * pos['amount']
-            position_details.append({
-                'coin': coin,
-                'buy_price': pos['buy_price'],
-                'amount': pos['amount'],
-                'buy_time': pos['timestamp']
-            })
-        
-        # 전체 수익률
-        if self.initial_balance > 0:
-            total_return = ((total_value - self.initial_balance) / self.initial_balance) * 100
-        else:
-            total_return = 0
-        
-        # 승률
-        win_rate = (self.wins / self.total_trades * 100) if self.total_trades > 0 else 0
-        
-        # 평균 수익
-        avg_profit = self.total_profit_krw / self.total_trades if self.total_trades > 0 else 0
-        
-        # 거래 시간
-        if self.start_time:
-            trading_duration = datetime.now() - self.start_time
-            hours = trading_duration.total_seconds() / 3600
-        else:
-            hours = 0
-        
-        return {
-            'initial_balance': self.initial_balance,
-            'current_balance': self.current_balance,
-            'total_value': total_value,
-            'total_return': total_return,
-            'total_profit_krw': self.total_profit_krw,
-            'total_trades': self.total_trades,
-            'wins': self.wins,
-            'losses': self.losses,
-            'win_rate': win_rate,
-            'avg_profit': avg_profit,
-            'max_drawdown': self.max_drawdown,
-            'positions': position_details,
-            'trading_hours': hours,
-            'start_time': self.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.start_time else None
-        }
+        with self.lock:
+            total_value = self.current_balance
+            
+            # 보유 포지션 평가액 계산 (현재가 기준)
+            position_details = []
+            for coin, pos in self.positions.items():
+                current_price = pyupbit.get_current_price(coin)
+                if not current_price:
+                    current_price = pos['buy_price']
+                
+                total_value += current_price * pos['amount']
+                position_details.append({
+                    'coin': coin,
+                    'buy_price': pos['buy_price'],
+                    'amount': pos['amount'],
+                    'buy_time': pos['timestamp']
+                })
+            
+            # 전체 수익률
+            if self.initial_balance > 0:
+                total_return = ((total_value - self.initial_balance) / self.initial_balance) * 100
+            else:
+                total_return = 0
+            
+            # 승률
+            win_rate = (self.wins / self.total_trades * 100) if self.total_trades > 0 else 0
+            
+            # 평균 수익
+            avg_profit = self.total_profit_krw / self.total_trades if self.total_trades > 0 else 0
+            
+            # 거래 시간
+            if self.start_time:
+                trading_duration = datetime.now() - self.start_time
+                hours = trading_duration.total_seconds() / 3600
+            else:
+                hours = 0
+            
+            return {
+                'initial_balance': self.initial_balance,
+                'current_balance': self.current_balance,
+                'total_value': total_value,
+                'total_return': total_return,
+                'total_profit_krw': self.total_profit_krw,
+                'total_trades': self.total_trades,
+                'wins': self.wins,
+                'losses': self.losses,
+                'win_rate': win_rate,
+                'avg_profit': avg_profit,
+                'max_drawdown': self.max_drawdown,
+                'positions': position_details,
+                'trading_hours': hours,
+                'start_time': self.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.start_time else None
+            }
     
     def get_coin_stats(self):
         """코인별 통계 조회"""

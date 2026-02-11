@@ -6,12 +6,25 @@ import requests
 from datetime import datetime
 import threading
 import time
+import re
 
 
 class TelegramNotifier:
     def __init__(self, config):
         self.config = config.get('telegram', {})
         self.enabled = self.config.get('enabled', False)
+        
+        # 속성 기본값(비활성/설정오류 시에도 접근 가능해야 함)
+        self.enable_commands = False
+        self.last_update_id = 0
+        self.command_thread = None
+        self.is_listening = False
+        self.command_handler = None
+        self.silent_mode = False
+        self.notify_buy_enabled = True
+        self.notify_sell_enabled = True
+        self.notify_error_enabled = True
+        self.notify_daily_enabled = True
         
         # enabled=true인 경우 필수 정보 검증
         if self.enabled:
@@ -32,6 +45,22 @@ class TelegramNotifier:
             
             # 정상 설정된 경우에만 초기화
             else:
+                # 토큰/채팅ID 형식 검증
+                token_ok = re.match(r'^\d{6,12}:[A-Za-z0-9_-]{30,}$', self.bot_token) is not None
+                chat_ok = str(self.chat_id).lstrip('-').isdigit()
+                
+                if not token_ok:
+                    print("⚠️  텔레그램 bot_token 형식이 올바르지 않습니다.")
+                    print("   BotFather에서 받은 토큰(예: 123456789:AA...)을 확인하세요.")
+                    self.enabled = False
+                    return
+                
+                if not chat_ok:
+                    print("⚠️  텔레그램 chat_id 형식이 올바르지 않습니다.")
+                    print("   chat_id는 숫자(개인) 또는 -100... (그룹) 형식이어야 합니다.")
+                    self.enabled = False
+                    return
+                
                 self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
                 
                 # 알림 설정
@@ -43,10 +72,6 @@ class TelegramNotifier:
                 
                 # 명령어 처리
                 self.enable_commands = self.config.get('enable_commands', False)
-                self.last_update_id = 0
-                self.command_thread = None
-                self.is_listening = False
-                self.command_handler = None  # 외부에서 설정
                 
                 print("✅ 텔레그램 알림 활성화됨")
     
@@ -146,7 +171,7 @@ class TelegramNotifier:
 
 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-QuantPilot이 자동 매매를 시작합니다.
+upbit_trading_bot이 자동 매매를 시작합니다.
 """
         self.send_message(message)
     

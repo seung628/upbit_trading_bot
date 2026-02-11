@@ -11,17 +11,23 @@
     "_comment": "거래 기본 설정",
     "max_coins": 3,
     "buy_amount_krw": 100000,
+    "untracked_balance": {
+      "_comment": "미기록 잔고 처리: ignore | attach | cleanup_small",
+      "action": "ignore",
+      "cleanup_max_krw": 20000
+    },
     "min_trade_amount": 5500,
     "check_interval_seconds": 10
   },
   
   "coin_selection": {
-    "_comment": "코인 선정 기준",
+    "_comment": "코인 선정/보호 기준 (excluded_coins는 미기록 잔고 처리에서도 미개입)",
     "min_volume_krw": 10000000000,
     "min_volatility": 3,
     "max_volatility": 15,
     "lookback_days": 1,
     "refresh_interval_hours": 1,
+    "empty_list_retry_seconds": 60,
     "excluded_coins": ["BTC", "ETH"]
   },
   
