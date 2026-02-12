@@ -1482,7 +1482,13 @@ class TradingBot:
                     continue
                 
                 # 각 코인별로 매매 체크
-                for ticker in self.target_coins:
+                # 보유 포지션은 대상 목록에서 제외되더라도 항상 매도 신호를 체크해야 함
+                tickers_to_check = list(self.target_coins)
+                for held in list(self.stats.positions.keys()):
+                    if held not in tickers_to_check:
+                        tickers_to_check.append(held)
+
+                for ticker in tickers_to_check:
                     
                     # 포지션 없을 때 - 매수 검토
                     if ticker not in self.stats.positions:

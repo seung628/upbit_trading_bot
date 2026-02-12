@@ -17,6 +17,17 @@ class CoinSelector:
         self.min_volatility = config['coin_selection']['min_volatility']
         self.max_volatility = config['coin_selection']['max_volatility']
         self.excluded_coins = config['coin_selection'].get('excluded_coins', [])
+
+        # 매수 엔진과 동일한 RSI 진입 범위를 종목 선정에도 적용
+        indicators = config.get('indicators', {})
+        try:
+            self.rsi_buy_min = float(indicators.get('rsi_buy_min', 50))
+        except Exception:
+            self.rsi_buy_min = 50.0
+        try:
+            self.rsi_buy_max = float(indicators.get('rsi_buy_max', 70))
+        except Exception:
+            self.rsi_buy_max = 70.0
     
     def get_top_coins(self, max_coins=3):
         """단타 거래에 적합한 코인 선정"""
@@ -81,6 +92,10 @@ class CoinSelector:
                         rsi_slope = float(current_rsi - rsi.iloc[-11])  # 10분 변화량
                     except Exception:
                         rsi_slope = 0.0
+
+                    # RSI 진입 범위 필터 (과매도 캐치 제거)
+                    if pd.isna(current_rsi) or current_rsi < self.rsi_buy_min or current_rsi >= self.rsi_buy_max:
+                        continue
                     
                     # 점수 계산
                     score = self._calculate_score(
