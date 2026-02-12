@@ -70,6 +70,16 @@ class TradingEngine:
         # 안전 장치
         self.max_spread_pct = config['trading'].get('max_spread_percent', 0.5)
         self.min_orderbook_depth = config['trading'].get('min_orderbook_depth_krw', 5000000)
+
+        # RSI 진입 필터 (수익 관점에서 과매도 캐치 방지)
+        try:
+            self.rsi_buy_min = float(config.get('indicators', {}).get('rsi_buy_min', 50))
+        except Exception:
+            self.rsi_buy_min = 50.0
+        try:
+            self.rsi_buy_max = float(config.get('indicators', {}).get('rsi_buy_max', 70))
+        except Exception:
+            self.rsi_buy_max = 70.0
         
         # pyupbit Remaining-Req 파싱 오류 우회 패치
         self._patch_pyupbit_remaining_req_parser()
@@ -248,6 +258,19 @@ class TradingEngine:
             # 확정 봉만 사용 (iloc[-2])
             current = df.iloc[-2]  # 마감된 직전 봉
             prev = df.iloc[-3]
+
+            # RSI 범위 필터: 최근 데이터 기준으로는 RSI<40(특히 <35) 구간 진입이 손익/승률 모두 악화되는 경향
+            rsi_value = current.get('rsi')
+            if pd.isna(rsi_value):
+                self.logger.debug(f"  {ticker} ❌ RSI 데이터 없음")
+                return False, ["RSI없음"], current['close'], 0
+
+            if rsi_value < self.rsi_buy_min or rsi_value >= self.rsi_buy_max:
+                self.logger.debug(
+                    f"  {ticker} ❌ RSI 범위 아님 ({rsi_value:.1f}, "
+                    f"{self.rsi_buy_min:.0f}~{self.rsi_buy_max:.0f})"
+                )
+                return False, [f"RSI({rsi_value:.1f})"], current['close'], 0
             
             # 추세 확인 (횡보장 필터링)
             if self.check_trend:
@@ -278,17 +301,16 @@ class TradingEngine:
             else:
                 signal_details.append("❌ BB하단반등(미충족)")
             
-            # 신호 2: RSI 과매도 (3점 - 강함)
-            if current['rsi'] < 30:
-                signals.append(f"RSI과매도({current['rsi']:.1f})")
-                signal_details.append(f"✅ RSI강과매도(3점, {current['rsi']:.1f})")
-                total_score += 3
-            elif current['rsi'] < 35:
-                signals.append(f"RSI약과매도({current['rsi']:.1f})")
-                signal_details.append(f"✅ RSI약과매도(2점, {current['rsi']:.1f})")
+            # 신호 2: RSI 강도 (모멘텀 구간 선호)
+            # - 기본 진입 필터(rsi_buy_min~rsi_buy_max)를 통과한 상태에서 점수만 부여
+            if current['rsi'] < 60:
+                signals.append(f"RSI양호({current['rsi']:.1f})")
+                signal_details.append(f"✅ RSI양호(2점, {current['rsi']:.1f})")
                 total_score += 2
             else:
-                signal_details.append(f"❌ RSI과매도(미충족, {current['rsi']:.1f})")
+                signals.append(f"RSI강세({current['rsi']:.1f})")
+                signal_details.append(f"✅ RSI강세(1점, {current['rsi']:.1f})")
+                total_score += 1
             
             # 신호 3: 거래량 급증 (3점 - 강함)
             volume_ratio = current['volume'] / current['volume_ma']
@@ -318,6 +340,14 @@ class TradingEngine:
                 total_score += 1
             else:
                 signal_details.append("❌ MA5상승(미충족)")
+
+            # 신호 5.5: 가격이 MA20 위 (2점) - 추세/모멘텀 필터
+            if not pd.isna(current['ma20']) and current['close'] > current['ma20']:
+                signals.append("가격>MA20")
+                signal_details.append("✅ 가격>MA20(2점)")
+                total_score += 2
+            else:
+                signal_details.append("❌ 가격>MA20(미충족)")
             
             # 신호 6: BB 하위 위치 (2점)
             if not pd.isna(current['bb_upper']) and not pd.isna(current['bb_lower']):

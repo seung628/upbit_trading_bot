@@ -196,12 +196,16 @@ class TradingBot:
             print(f"\n  📊 신호별 점수:")
             print(f"     거래량 폭증 (2배+)      : 3점")
             print(f"     MACD 골든크로스          : 3점")
-            print(f"     RSI 강한 과매도 (<30)   : 3점")
             print(f"     거래량 급증 (1.8배)     : 2점")
-            print(f"     RSI 약한 과매도 (30-35) : 2점")
             print(f"     BB 하단 반등             : 2점")
+            print(f"     가격 > MA20              : 2점")
+            print(f"     RSI 양호 (50-60)         : 2점")
             print(f"     BB 하위 25%              : 2점")
+            print(f"     RSI 강세 (60-70)         : 1점")
             print(f"     MA5 상승                 : 1점")
+
+            print(f"\n  🔒 RSI 진입 필터:")
+            print(f"     RSI 50~70 구간에서만 매수 검토 (과매도 캐치 최소화)")
         else:
             print(f"  ❌ 미사용: 신호 개수 기준 ({self.config['indicators']['min_signals_required']}개 이상)")
         

@@ -77,10 +77,14 @@ class CoinSelector:
                     rs = gain / loss
                     rsi = 100 - (100 / (1 + rs))
                     current_rsi = rsi.iloc[-1]
+                    try:
+                        rsi_slope = float(current_rsi - rsi.iloc[-11])  # 10분 변화량
+                    except Exception:
+                        rsi_slope = 0.0
                     
                     # 점수 계산
                     score = self._calculate_score(
-                        volume_krw, volatility, volume_trend, bb_width, current_rsi
+                        volume_krw, volatility, volume_trend, bb_width, current_rsi, rsi_slope
                     )
                     
                     coin_data.append({
@@ -134,7 +138,7 @@ class CoinSelector:
             self.logger.log_error("코인 선정 중 오류 발생", e)
             return []
     
-    def _calculate_score(self, volume_krw, volatility, volume_trend, bb_width, rsi):
+    def _calculate_score(self, volume_krw, volatility, volume_trend, bb_width, rsi, rsi_slope=0.0):
         """코인 점수 계산"""
         
         # 거래량 점수 (로그 스케일)
@@ -166,14 +170,31 @@ class CoinSelector:
         else:
             bb_score = 5
         
-        # RSI 점수 (과매도 선호)
+        # RSI 점수 (모멘텀 구간 선호: 50~70)
+        # - 최근 거래 데이터 기준으로 RSI<40 구간 진입은 손익이 악화되는 경향이 있어 가중치 축소
         if rsi < 40:
-            rsi_score = 20
+            rsi_score = 0
+        elif rsi < 45:
+            rsi_score = 6
         elif rsi < 50:
-            rsi_score = 10
+            rsi_score = 8
+        elif rsi < 65:
+            rsi_score = 20
+        elif rsi < 70:
+            rsi_score = 14
         else:
-            rsi_score = 5
+            rsi_score = 6
+
+        # RSI 기울기(10분): 상승 모멘텀 가점
+        if rsi_slope >= 5:
+            rsi_slope_score = 10
+        elif rsi_slope >= 2:
+            rsi_slope_score = 6
+        elif rsi_slope > 0:
+            rsi_slope_score = 3
+        else:
+            rsi_slope_score = 0
         
-        total_score = volume_score + volatility_score + trend_score + bb_score + rsi_score
+        total_score = volume_score + volatility_score + trend_score + bb_score + rsi_score + rsi_slope_score
         
         return total_score
