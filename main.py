@@ -1477,9 +1477,11 @@ class TradingBot:
                             f"🔁 거래 가능 종목 재탐색 중... (주기 {self.empty_list_retry_seconds}초)"
                         )
                         self._refresh_coin_list()
-                    
-                    time.sleep(min(self.check_interval, self.empty_list_retry_seconds))
-                    continue
+
+                    # 대상 종목도 없고 보유 포지션도 없으면 대기만 하고 루프 종료
+                    if not self.stats.positions:
+                        time.sleep(min(self.check_interval, self.empty_list_retry_seconds))
+                        continue
                 
                 # 각 코인별로 매매 체크
                 # 보유 포지션은 대상 목록에서 제외되더라도 항상 매도 신호를 체크해야 함
