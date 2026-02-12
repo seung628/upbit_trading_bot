@@ -519,11 +519,8 @@ class TradingBot:
 
         # 수수료/예상 청산 수수료(보유 포지션 기준)
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_exit_fee = 0.0
-        for coin, pos in self.stats.positions.items():
-            price = self.engine.get_current_price(coin) or pos.get('buy_price')
-            if price:
-                est_exit_fee += float(price) * float(pos.get('amount', 0) or 0) * fee_rate
+        positions_value = max(0.0, float(status.get('total_value', 0) or 0) - float(status.get('current_balance', 0) or 0))
+        est_exit_fee = positions_value * fee_rate
         
         state = "▶️ 실행 중" if self.is_running else "⏸️ 정지"
         if self.is_trading_paused:
@@ -915,11 +912,8 @@ class TradingBot:
         print(f"  총 손익: {status['total_profit_krw']:+,.0f}원")
 
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_exit_fee = 0.0
-        for coin, pos in self.stats.positions.items():
-            price = self.engine.get_current_price(coin) or pos.get('buy_price')
-            if price:
-                est_exit_fee += float(price) * float(pos.get('amount', 0) or 0) * fee_rate
+        positions_value = max(0.0, float(status.get('total_value', 0) or 0) - float(status.get('current_balance', 0) or 0))
+        est_exit_fee = positions_value * fee_rate
 
         print(f"\n💸 수수료(추정) (수수료율 {fee_rate*100:.3f}%)")
         print(f"  누적 수수료(세션): {status.get('total_fees_krw', 0):,.0f}원")
