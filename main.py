@@ -52,10 +52,13 @@ class TradingBot:
         self.buy_amount_krw = self.config['trading']['buy_amount_krw']
         self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
         self.dynamic_allocation = self.config['trading'].get('dynamic_allocation', False)
-        self.auto_start_on_launch = self.config['trading'].get('auto_start_on_launch', True)
+        _auto = self.config['trading'].get('auto_start_on_launch', True)
+        self.auto_start_on_launch = True if _auto is None else bool(_auto)
         self.check_interval = self.config['trading']['check_interval_seconds']
         self.refresh_interval_hours = self.config['coin_selection'].get('refresh_interval_hours', 1)
         self.empty_list_retry_seconds = self.config['coin_selection'].get('empty_list_retry_seconds', 60)
+        self.empty_list_retry_max_seconds = self.config['coin_selection'].get('empty_list_retry_max_seconds', 600)
+        self._empty_list_fail_count = 0
         
         # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
         try:
@@ -107,9 +110,7 @@ class TradingBot:
         if initial_balance < self.config['trading']['min_trade_amount']:
             print(f"❌ 거래 가능 금액이 부족합니다. (최소 {self.config['trading']['min_trade_amount']:,}원)")
             return
-        
-        self.stats.start(initial_balance)
-        
+
         # 포지션 복구 시도
         saved_positions = self.stats.load_positions()
         if saved_positions:
@@ -150,12 +151,55 @@ class TradingBot:
         
         # 스냅샷에 없는 실제 잔고 처리
         self._sync_untracked_balances()
+
+        # 시작 총자산(현금+보유 포지션 평가액) 기준선 설정 (재기동 시 수익률 왜곡 방지)
+        initial_total_value = self._estimate_total_value(initial_balance)
+        positions_value = max(0.0, float(initial_total_value) - float(initial_balance))
+        self.logger.info(
+            f"📌 시작 총자산 기준선: {initial_total_value:,.0f}원 "
+            f"(현금 {float(initial_balance):,.0f}원 + 포지션 {positions_value:,.0f}원)"
+        )
+        self.stats.start(initial_balance, initial_total_value=initial_total_value)
         
         # 코인 선정
         self.target_coins = self.coin_selector.get_top_coins(self.max_coins)
         self.last_coin_refresh = datetime.now()
         if not self.target_coins:
             self.logger.warning("⚠️ 거래 가능한 코인이 없습니다. 대기 상태로 시작 후 주기적으로 재조회합니다.")
+
+        # 분석 로그: 세션 시작/초기 선정
+        self.logger.log_decision(
+            "START",
+            {
+                "version": self.bot_version,
+                "initial_cash_krw": float(initial_balance),
+                "initial_total_value_krw": float(initial_total_value),
+                "initial_positions_value_krw": float(positions_value),
+                "recovered_positions": list(self.stats.positions.keys()),
+                "selected_coins": list(self.target_coins),
+                "protected_coins": sorted(list(self.protected_coins)),
+                "config": {
+                    "max_coins": int(self.max_coins),
+                    "check_interval_seconds": float(self.check_interval),
+                    "use_signal_scoring": bool(self.config.get("indicators", {}).get("use_signal_scoring", False)),
+                    "min_signal_score": int(self.config.get("indicators", {}).get("min_signal_score", 7) or 7),
+                    "rsi_buy_min": float(self.config.get("indicators", {}).get("rsi_buy_min", 50) or 50),
+                    "rsi_buy_max": float(self.config.get("indicators", {}).get("rsi_buy_max", 70) or 70),
+                    "require_price_above_ma20": (
+                        True
+                        if self.config.get("indicators", {}).get("require_price_above_ma20", True) is None
+                        else bool(self.config.get("indicators", {}).get("require_price_above_ma20", True))
+                    ),
+                    "require_strong_trigger": (
+                        True
+                        if self.config.get("indicators", {}).get("require_strong_trigger", True) is None
+                        else bool(self.config.get("indicators", {}).get("require_strong_trigger", True))
+                    ),
+                    "strong_trigger_min_volume_ratio": float(self.config.get("indicators", {}).get("strong_trigger_min_volume_ratio", 1.8) or 1.8),
+                    "fee_pct": self.config.get("trading", {}).get("fee_pct", None),
+                },
+            },
+        )
         
         # 거래 시작
         self.is_running = True
@@ -206,6 +250,19 @@ class TradingBot:
 
             print(f"\n  🔒 RSI 진입 필터:")
             print(f"     RSI 50~70 구간에서만 매수 검토 (과매도 캐치 최소화)")
+
+            # 매수 품질 필터(과매매/수수료 드래그 완화)
+            require_price_above_ma20 = self.config.get('indicators', {}).get('require_price_above_ma20', True)
+            require_price_above_ma20 = True if require_price_above_ma20 is None else bool(require_price_above_ma20)
+            require_strong_trigger = self.config.get('indicators', {}).get('require_strong_trigger', True)
+            require_strong_trigger = True if require_strong_trigger is None else bool(require_strong_trigger)
+            strong_vol = self.config.get('indicators', {}).get('strong_trigger_min_volume_ratio', 1.8)
+
+            print(f"\n  🎛️ 매수 품질 필터:")
+            print(f"     가격 > MA20 필수: {'ON' if require_price_above_ma20 else 'OFF'}")
+            print(f"     강한 트리거 필수(거래량/MACD): {'ON' if require_strong_trigger else 'OFF'}")
+            if require_strong_trigger:
+                print(f"       - 거래량 트리거 기준: {strong_vol}배 이상 또는 MACD 골든크로스")
         else:
             print(f"  ❌ 미사용: 신호 개수 기준 ({self.config['indicators']['min_signals_required']}개 이상)")
         
@@ -439,11 +496,19 @@ class TradingBot:
                     
                     sold_cost = position['buy_price'] * sell_result['amount']
                     profit_krw = sell_result['total_krw'] - sold_cost
-                    self.stats.remove_position(coin, sell_result['price'], profit_krw, "정지시 청산")
+                    self.stats.remove_position(
+                        coin,
+                        sell_result['price'],
+                        profit_krw,
+                        "정지시 청산",
+                        sell_fee_krw=sell_result.get('fee', 0),
+                        sell_meta={"note": "정지시 청산"},
+                    )
         
         # 최종 잔고
         final_balance = self.engine.get_balance("KRW")
-        self.stats.update_balance(final_balance)
+        final_total_value = self._estimate_total_value(final_balance)
+        self.stats.update_balance(final_balance, current_total_value=final_total_value)
         
         # 통계 저장
         self.logger.log_daily_stats(self.stats.get_current_status())
@@ -574,26 +639,56 @@ class TradingBot:
         if not today_trades:
             self.telegram.send_message("📅 오늘 거래 내역이 없습니다.")
             return
-        
-        wins = [t for t in today_trades if t['profit_krw'] > 0]
-        losses = [t for t in today_trades if t['profit_krw'] <= 0]
-        total_profit = sum(t['profit_krw'] for t in today_trades)
-        
+
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_buy_fee = 0.0
-        est_sell_fee = 0.0
+        buy_fee_sum = 0.0
+        sell_fee_sum = 0.0
+        total_profit = 0.0
+        total_profit_after_fees = 0.0
+        turnover_krw = 0.0
+        turnover_krw = 0.0
+
+        def _paf(tr):
+            paf = tr.get('profit_after_fees_krw', None)
+            if paf is not None:
+                return float(paf or 0)
+            try:
+                bp = float(tr.get('buy_price', 0) or 0)
+                amt = float(tr.get('amount', 0) or 0)
+                bf = float(tr.get('buy_fee_krw', 0) or 0)
+                if bf <= 0:
+                    bf = bp * amt * fee_rate
+                return float(tr.get('profit_krw', 0) or 0) - bf
+            except Exception:
+                return float(tr.get('profit_krw', 0) or 0)
+
         for t in today_trades:
             try:
+                total_profit += float(t.get('profit_krw', 0) or 0)
+                total_profit_after_fees += _paf(t)
+
                 buy_price = float(t.get('buy_price', 0) or 0)
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
-                est_buy_fee += buy_price * amount * fee_rate
-                est_sell_fee += sell_price * amount * fee_rate
+                turnover_krw += (buy_price * amount) + (sell_price * amount)
+                turnover_krw += (buy_price * amount) + (sell_price * amount)
+
+                buy_fee = t.get('buy_fee_krw', None)
+                sell_fee = t.get('sell_fee_krw', None)
+                if buy_fee is None:
+                    buy_fee = buy_price * amount * fee_rate
+                if sell_fee is None:
+                    sell_fee = sell_price * amount * fee_rate
+                buy_fee_sum += float(buy_fee or 0)
+                sell_fee_sum += float(sell_fee or 0)
             except Exception:
                 continue
-        est_total_fee = est_buy_fee + est_sell_fee
-        # profit_krw는 매도 수수료(net) 기준이므로, 매수 수수료만 추가 반영한 손익(추정)
-        est_profit_after_fees = total_profit - est_buy_fee
+
+        wins = [t for t in today_trades if _paf(t) > 0]
+        losses = [t for t in today_trades if _paf(t) <= 0]
+        total_fee_sum = buy_fee_sum + sell_fee_sum
+        fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
+        fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
         
         message = f"""📅 <b>일일 통계</b>
 
@@ -605,18 +700,20 @@ class TradingBot:
 📈 승률: {len(wins)/len(today_trades)*100:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
-💸 예상 수수료(기간): {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f} + 매도 {est_sell_fee:,.0f})
+💰 총 손익(수수료 반영): {total_profit_after_fees:+,.0f}원
+💸 수수료(기간): {total_fee_sum:,.0f}원 (매수 {buy_fee_sum:,.0f} + 매도 {sell_fee_sum:,.0f})
+거래대금(왕복): {turnover_krw:,.0f}원
+수수료/거래대금: {fee_turnover_str}
 💸 누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원
-💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 """
         
         if wins:
-            best = max(wins, key=lambda x: x['profit_krw'])
-            message += f"\n🏆 최고: {best['coin'].replace('KRW-', '')} {best['profit_krw']:+,.0f}원"
+            best = max(wins, key=_paf)
+            message += f"\n🏆 최고: {best['coin'].replace('KRW-', '')} {_paf(best):+,.0f}원"
         
         if losses:
-            worst = min(losses, key=lambda x: x['profit_krw'])
-            message += f"\n📉 최악: {worst['coin'].replace('KRW-', '')} {worst['profit_krw']:+,.0f}원"
+            worst = min(losses, key=_paf)
+            message += f"\n📉 최악: {worst['coin'].replace('KRW-', '')} {_paf(worst):+,.0f}원"
         
         self.telegram.send_message(message)
 
@@ -650,29 +747,56 @@ class TradingBot:
                 f"기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}"
             )
             return
-        
-        wins = [t for t in week_trades if t['profit_krw'] > 0]
-        losses = [t for t in week_trades if t['profit_krw'] <= 0]
-        total_profit = sum(t['profit_krw'] for t in week_trades)
-        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
 
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_buy_fee = 0.0
-        est_sell_fee = 0.0
+
+        def _paf(tr):
+            paf = tr.get('profit_after_fees_krw', None)
+            if paf is not None:
+                return float(paf or 0)
+            try:
+                bp = float(tr.get('buy_price', 0) or 0)
+                amt = float(tr.get('amount', 0) or 0)
+                bf = float(tr.get('buy_fee_krw', 0) or 0)
+                if bf <= 0:
+                    bf = bp * amt * fee_rate
+                return float(tr.get('profit_krw', 0) or 0) - bf
+            except Exception:
+                return float(tr.get('profit_krw', 0) or 0)
+
+        buy_fee_sum = 0.0
+        sell_fee_sum = 0.0
+        total_profit = 0.0
+        total_profit_after_fees = 0.0
+
         for t in week_trades:
             try:
+                total_profit += float(t.get('profit_krw', 0) or 0)
+                total_profit_after_fees += _paf(t)
+
                 buy_price = float(t.get('buy_price', 0) or 0)
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
-                est_buy_fee += buy_price * amount * fee_rate
-                est_sell_fee += sell_price * amount * fee_rate
+
+                buy_fee = t.get('buy_fee_krw', None)
+                sell_fee = t.get('sell_fee_krw', None)
+                if buy_fee is None:
+                    buy_fee = buy_price * amount * fee_rate
+                if sell_fee is None:
+                    sell_fee = sell_price * amount * fee_rate
+                buy_fee_sum += float(buy_fee or 0)
+                sell_fee_sum += float(sell_fee or 0)
             except Exception:
                 continue
-        est_total_fee = est_buy_fee + est_sell_fee
-        est_profit_after_fees = total_profit - est_buy_fee
+
+        wins = [t for t in week_trades if _paf(t) > 0]
+        losses = [t for t in week_trades if _paf(t) <= 0]
+        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
+
+        total_fee_sum = buy_fee_sum + sell_fee_sum
         
-        best = max(week_trades, key=lambda x: x['profit_krw'])
-        worst = min(week_trades, key=lambda x: x['profit_krw'])
+        best = max(week_trades, key=_paf)
+        worst = min(week_trades, key=_paf)
         
         # 일자별 손익/횟수
         daily_profit = {}
@@ -687,11 +811,11 @@ class TradingBot:
         
         for t in week_trades:
             d = t['timestamp'].date()
-            daily_profit[d] = daily_profit.get(d, 0) + t['profit_krw']
+            daily_profit[d] = daily_profit.get(d, 0) + _paf(t)
             daily_count[d] = daily_count.get(d, 0) + 1
             
             coin = t['coin'].replace('KRW-', '')
-            coin_profit[coin] = coin_profit.get(coin, 0) + t['profit_krw']
+            coin_profit[coin] = coin_profit.get(coin, 0) + _paf(t)
         
         top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
         top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
@@ -709,9 +833,11 @@ class TradingBot:
 📈 승률: {win_rate:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
-💸 예상 수수료(기간): {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f} + 매도 {est_sell_fee:,.0f})
+💰 총 손익(수수료 반영): {total_profit_after_fees:+,.0f}원
+💸 수수료(기간): {total_fee_sum:,.0f}원 (매수 {buy_fee_sum:,.0f} + 매도 {sell_fee_sum:,.0f})
+거래대금(왕복): {turnover_krw:,.0f}원
+수수료/거래대금: {fee_turnover_str}
 💸 누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원
-💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 
 📅 <b>일자별 손익</b>"""
         
@@ -721,8 +847,8 @@ class TradingBot:
             message += f"\n{d.strftime('%m-%d')}: {pnl:+,.0f}원 ({cnt}회)"
         
         message += (
-            f"\n\n🏆 최고: {best_coin} {best['profit_krw']:+,.0f}원"
-            f"\n📉 최악: {worst_coin} {worst['profit_krw']:+,.0f}원"
+            f"\n\n🏆 최고: {best_coin} {_paf(best):+,.0f}원"
+            f"\n📉 최악: {worst_coin} {_paf(worst):+,.0f}원"
         )
         
         if top_winners:
@@ -916,6 +1042,8 @@ class TradingBot:
         print(f"  총 평가액: {status['total_value']:,.0f}원")
         print(f"  총 수익률: {status['total_return']:+.2f}%")
         print(f"  총 손익: {status['total_profit_krw']:+,.0f}원")
+        if 'total_profit_after_fees_krw' in status:
+            print(f"  총 손익(수수료 반영): {status.get('total_profit_after_fees_krw', 0):+,.0f}원")
 
         fee_rate = getattr(self.engine, "FEE", 0.0005)
         positions_value = max(0.0, float(status.get('total_value', 0) or 0) - float(status.get('current_balance', 0) or 0))
@@ -1008,19 +1136,40 @@ class TradingBot:
         avg_profit = total_profit / total_trades if total_trades > 0 else 0
 
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_buy_fee = 0.0
-        est_sell_fee = 0.0
+        buy_fee_sum = 0.0
+        sell_fee_sum = 0.0
+        profit_after_fees_sum = 0.0
+        turnover_krw = 0.0
+
         for t in today_trades:
             try:
                 buy_price = float(t.get('buy_price', 0) or 0)
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
-                est_buy_fee += buy_price * amount * fee_rate
-                est_sell_fee += sell_price * amount * fee_rate
+                turnover_krw += (buy_price * amount) + (sell_price * amount)
+
+                buy_fee = t.get('buy_fee_krw', None)
+                sell_fee = t.get('sell_fee_krw', None)
+
+                if buy_fee is None:
+                    buy_fee = buy_price * amount * fee_rate
+                if sell_fee is None:
+                    sell_fee = sell_price * amount * fee_rate
+
+                buy_fee = float(buy_fee or 0)
+                sell_fee = float(sell_fee or 0)
+
+                buy_fee_sum += buy_fee
+                sell_fee_sum += sell_fee
+
+                paf = t.get('profit_after_fees_krw', None)
+                if paf is None:
+                    paf = float(t.get('profit_krw', 0) or 0) - buy_fee
+                profit_after_fees_sum += float(paf or 0)
             except Exception:
                 continue
-        est_total_fee = est_buy_fee + est_sell_fee
-        est_profit_after_fees = total_profit - est_buy_fee
+
+        total_fee_sum = buy_fee_sum + sell_fee_sum
         
         best_trade = max(today_trades, key=lambda x: x['profit_rate'])
         worst_trade = min(today_trades, key=lambda x: x['profit_rate'])
@@ -1032,7 +1181,16 @@ class TradingBot:
             if coin not in coin_profits:
                 coin_profits[coin] = {'trades': 0, 'profit': 0}
             coin_profits[coin]['trades'] += 1
-            coin_profits[coin]['profit'] += trade['profit_krw']
+            paf = trade.get('profit_after_fees_krw', None)
+            if paf is None:
+                try:
+                    buy_fee = float(trade.get('buy_fee_krw', 0) or 0)
+                    if buy_fee <= 0:
+                        buy_fee = float(trade.get('buy_price', 0) or 0) * float(trade.get('amount', 0) or 0) * fee_rate
+                except Exception:
+                    buy_fee = 0.0
+                paf = float(trade.get('profit_krw', 0) or 0) - buy_fee
+            coin_profits[coin]['profit'] += float(paf or 0)
         
         # 출력
         print(f"\n📊 오늘 ({today.strftime('%Y-%m-%d')})")
@@ -1043,9 +1201,12 @@ class TradingBot:
         print(f"\n💰 수익 현황")
         print(f"  총 손익: {total_profit:+,.0f}원")
         print(f"  평균 손익: {avg_profit:+,.0f}원")
-        print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
-        print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
-        print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
+        print(f"  총 손익(수수료 반영): {profit_after_fees_sum:+,.0f}원")
+        print(f"\n💸 수수료(기간) (수수료율 {fee_rate*100:.3f}%)")
+        print(f"  합계: {total_fee_sum:,.0f}원 (매수 {buy_fee_sum:,.0f}원 + 매도 {sell_fee_sum:,.0f}원)")
+        if turnover_krw > 0:
+            print(f"  거래대금(왕복): {turnover_krw:,.0f}원")
+            print(f"  수수료/거래대금: {(total_fee_sum/turnover_krw*100):.3f}%")
         print(f"  누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원")
         
         print(f"\n🏆 최고 거래")
@@ -1105,28 +1266,67 @@ class TradingBot:
             print("="*80 + "\n")
             return
 
-        wins = [t for t in week_trades if t['profit_krw'] > 0]
-        losses = [t for t in week_trades if t['profit_krw'] <= 0]
-        total_profit = sum(t['profit_krw'] for t in week_trades)
-        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
-
         fee_rate = getattr(self.engine, "FEE", 0.0005)
-        est_buy_fee = 0.0
-        est_sell_fee = 0.0
+
+        # 수수료 반영 손익(가능하면 trade_history의 profit_after_fees_krw 사용, 없으면 추정)
+        def _paf(tr):
+            paf = tr.get('profit_after_fees_krw', None)
+            if paf is not None:
+                return float(paf or 0)
+            try:
+                bp = float(tr.get('buy_price', 0) or 0)
+                amt = float(tr.get('amount', 0) or 0)
+                bf = float(tr.get('buy_fee_krw', 0) or 0)
+                if bf <= 0:
+                    bf = bp * amt * fee_rate
+                return float(tr.get('profit_krw', 0) or 0) - bf
+            except Exception:
+                return float(tr.get('profit_krw', 0) or 0)
+
+        buy_fee_sum = 0.0
+        sell_fee_sum = 0.0
+        total_profit = 0.0
+        total_profit_after_fees = 0.0
+        turnover_krw = 0.0
+
         for t in week_trades:
             try:
+                total_profit += float(t.get('profit_krw', 0) or 0)
+
                 buy_price = float(t.get('buy_price', 0) or 0)
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
-                est_buy_fee += buy_price * amount * fee_rate
-                est_sell_fee += sell_price * amount * fee_rate
+                turnover_krw += (buy_price * amount) + (sell_price * amount)
+
+                buy_fee = t.get('buy_fee_krw', None)
+                sell_fee = t.get('sell_fee_krw', None)
+
+                if buy_fee is None:
+                    buy_fee = buy_price * amount * fee_rate
+                if sell_fee is None:
+                    sell_fee = sell_price * amount * fee_rate
+
+                buy_fee = float(buy_fee or 0)
+                sell_fee = float(sell_fee or 0)
+
+                buy_fee_sum += buy_fee
+                sell_fee_sum += sell_fee
+
+                paf = t.get('profit_after_fees_krw', None)
+                if paf is None:
+                    paf = float(t.get('profit_krw', 0) or 0) - buy_fee
+                total_profit_after_fees += float(paf or 0)
             except Exception:
                 continue
-        est_total_fee = est_buy_fee + est_sell_fee
-        est_profit_after_fees = total_profit - est_buy_fee
 
-        best = max(week_trades, key=lambda x: x['profit_krw'])
-        worst = min(week_trades, key=lambda x: x['profit_krw'])
+        wins = [t for t in week_trades if _paf(t) > 0]
+        losses = [t for t in week_trades if _paf(t) <= 0]
+        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
+
+        total_fee_sum = buy_fee_sum + sell_fee_sum
+
+        best = max(week_trades, key=_paf)
+        worst = min(week_trades, key=_paf)
 
         # 일자별 손익/횟수
         daily_profit = {}
@@ -1141,11 +1341,11 @@ class TradingBot:
 
         for t in week_trades:
             d = t['timestamp'].date()
-            daily_profit[d] = daily_profit.get(d, 0) + t['profit_krw']
+            daily_profit[d] = daily_profit.get(d, 0) + _paf(t)
             daily_count[d] = daily_count.get(d, 0) + 1
 
             coin = t['coin'].replace('KRW-', '')
-            coin_profit[coin] = coin_profit.get(coin, 0) + t['profit_krw']
+            coin_profit[coin] = coin_profit.get(coin, 0) + _paf(t)
 
         top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
         top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
@@ -1160,9 +1360,12 @@ class TradingBot:
         print(f"📈 승률: {win_rate:.1f}%")
 
         print(f"\n💰 총 손익: {total_profit:+,.0f}원")
-        print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
-        print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
-        print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
+        print(f"💰 총 손익(수수료 반영): {total_profit_after_fees:+,.0f}원")
+        print(f"\n💸 수수료(기간) (수수료율 {fee_rate*100:.3f}%)")
+        print(f"  합계: {total_fee_sum:,.0f}원 (매수 {buy_fee_sum:,.0f}원 + 매도 {sell_fee_sum:,.0f}원)")
+        if turnover_krw > 0:
+            print(f"  거래대금(왕복): {turnover_krw:,.0f}원")
+            print(f"  수수료/거래대금: {(total_fee_sum/turnover_krw*100):.3f}%")
         print(f"  누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원")
 
         print(f"\n📅 일자별 손익")
@@ -1171,8 +1374,8 @@ class TradingBot:
             cnt = daily_count.get(d, 0)
             print(f"  {d.strftime('%Y-%m-%d')}: {pnl:+,.0f}원 ({cnt}회)")
 
-        print(f"\n🏆 최고 거래: {best_coin} {best['profit_krw']:+,.0f}원")
-        print(f"📉 최악 거래: {worst_coin} {worst['profit_krw']:+,.0f}원")
+        print(f"\n🏆 최고 거래: {best_coin} {_paf(best):+,.0f}원")
+        print(f"📉 최악 거래: {worst_coin} {_paf(worst):+,.0f}원")
 
         if top_winners:
             print(f"\n📈 종목 상위")
@@ -1328,6 +1531,30 @@ class TradingBot:
             return 0
         
         return investment
+
+    def _estimate_total_value(self, cash_balance):
+        """총자산(현금+포지션 평가액) 추정.
+
+        - 호출 시점의 포지션 수는 보통 0~3개 수준이므로, 현재가 조회 비용은 제한적입니다.
+        - 가격 조회 실패 시 매수가로 폴백합니다.
+        """
+        try:
+            cash = float(cash_balance or 0)
+        except Exception:
+            cash = 0.0
+
+        total = cash
+        for coin, pos in list(self.stats.positions.items()):
+            try:
+                price = self.engine.get_current_price(coin)
+                if not price:
+                    price = float(pos.get('buy_price', 0) or 0)
+                amount = float(pos.get('amount', 0) or 0)
+                total += float(price) * amount
+            except Exception:
+                continue
+
+        return float(total)
     
     def _refresh_coin_list(self, reason="auto"):
         """코인 목록 갱신 (기존 포지션은 유지).
@@ -1347,12 +1574,26 @@ class TradingBot:
         
         if not new_coins:
             self.logger.warning("⚠️  새로운 코인 선정 실패, 기존 목록 유지")
+            if reason == "empty":
+                self._empty_list_fail_count = int(self._empty_list_fail_count or 0) + 1
+            self.logger.log_decision(
+                "COIN_REFRESH",
+                {
+                    "reason": reason,
+                    "ok": False,
+                    "selected": [],
+                    "fail_count_empty": int(self._empty_list_fail_count or 0),
+                },
+            )
             if reason == "hourly":
                 self.telegram.send_message(
                     "⚠️ <b>1시간 자동 종목 갱신 실패</b>\n\n"
                     "조건에 맞는 코인이 없어 기존 목록을 유지합니다."
                 )
             return
+        
+        # 성공 시 empty 재시도 백오프 리셋
+        self._empty_list_fail_count = 0
         
         old_coins = set(self.target_coins)
         new_coins_set = set(new_coins)
@@ -1370,6 +1611,18 @@ class TradingBot:
         self.last_coin_refresh = refresh_ts
         
         self.logger.info(f"✅ 코인 목록 갱신 완료: {', '.join([c.replace('KRW-', '') for c in new_coins])}")
+
+        self.logger.log_decision(
+            "COIN_REFRESH",
+            {
+                "reason": reason,
+                "ok": True,
+                "selected": list(new_coins),
+                "kept": [c for c in sorted(kept_coins)],
+                "added": [c for c in sorted(added_coins)],
+                "removed": [c for c in sorted(removed_coins)],
+            },
+        )
         
         if reason == "hourly":
             message = (
@@ -1472,11 +1725,15 @@ class TradingBot:
                 # 거래 대상이 비어있으면 짧은 주기로 재조회
                 if not self.target_coins:
                     elapsed_sec = (datetime.now() - self.last_coin_refresh).total_seconds() if self.last_coin_refresh else 999999
-                    if elapsed_sec >= self.empty_list_retry_seconds:
+                    retry_interval = min(
+                        float(self.empty_list_retry_max_seconds or 600),
+                        float(self.empty_list_retry_seconds or 60) * (2 ** int(self._empty_list_fail_count or 0)),
+                    )
+                    if elapsed_sec >= retry_interval:
                         self.logger.info(
-                            f"🔁 거래 가능 종목 재탐색 중... (주기 {self.empty_list_retry_seconds}초)"
+                            f"🔁 거래 가능 종목 재탐색 중... (주기 {int(retry_interval)}초, 실패 {self._empty_list_fail_count}회)"
                         )
-                        self._refresh_coin_list()
+                        self._refresh_coin_list(reason="empty")
 
                     # 대상 종목도 없고 보유 포지션도 없으면 대기만 하고 루프 종료
                     if not self.stats.positions:
@@ -1539,14 +1796,67 @@ class TradingBot:
                             continue
                         
                         # 매수 신호 확인
-                        buy_signal, signals, current_price, signal_score = self.engine.check_buy_signal(ticker)
+                        buy_signal, signals, current_price, signal_score, buy_meta = self.engine.check_buy_signal(ticker)
+
+                        # 분석 로그: 점수는 충분한데(또는 근접한데) 품질 필터로 차단된 케이스 기록
+                        try:
+                            min_score = int(self.config.get('indicators', {}).get('min_signal_score', 7) or 7)
+                        except Exception:
+                            min_score = 7
+                        if (
+                            (not buy_signal)
+                            and isinstance(buy_meta, dict)
+                            and buy_meta.get("blocked_by")
+                            and int(signal_score or 0) >= min_score
+                        ):
+                            self.logger.log_decision(
+                                "BUY_BLOCKED",
+                                {
+                                    "ticker": ticker,
+                                    "score": int(signal_score or 0),
+                                    "signals": list(signals),
+                                    "blocked_by": list(buy_meta.get("blocked_by") or []),
+                                    "meta": buy_meta,
+                                },
+                            )
                         
                         if buy_signal and current_price:
+                            # 분석 로그 (매수 시그널 발생)
+                            self.logger.log_decision(
+                                "BUY_SIGNAL",
+                                {
+                                    "ticker": ticker,
+                                    "current_price": float(current_price),
+                                    "signals": list(signals),
+                                    "score": int(signal_score),
+                                    "meta": buy_meta or {},
+                                },
+                            )
+
                             # 호가창 안전성 체크
-                            is_safe, safety_msg = self.engine.check_orderbook_safety(ticker)
+                            is_safe, safety_msg, orderbook_details = self.engine.check_orderbook_safety(ticker)
                             if not is_safe:
                                 self.logger.debug(f"  {ticker} 호가 불안정: {safety_msg}")
+                                self.logger.log_decision(
+                                    "BUY_CANCELLED",
+                                    {
+                                        "ticker": ticker,
+                                        "reason": f"orderbook_unsafe:{safety_msg}",
+                                        "orderbook": orderbook_details or {},
+                                        "meta": buy_meta or {},
+                                    },
+                                )
                                 continue
+                            
+                            # 체결/슬리피지 분석용(매수 직전 스냅샷)
+                            mid_price = None
+                            try:
+                                ask = float((orderbook_details or {}).get("ask_price", 0) or 0)
+                                bid = float((orderbook_details or {}).get("bid_price", 0) or 0)
+                                if ask > 0 and bid > 0:
+                                    mid_price = (ask + bid) / 2
+                            except Exception:
+                                mid_price = None
                             
                             # 동적 투자 금액 계산
                             invest_amount = self._calculate_dynamic_investment(signal_score)
@@ -1576,12 +1886,17 @@ class TradingBot:
                                                 ticker,
                                                 buy_result['price'],
                                                 buy_result['amount'],
-                                                buy_result.get('uuid')
+                                                buy_result.get('uuid'),
+                                                buy_fee_krw=buy_result.get('fee', 0),
+                                                buy_signals=signals,
+                                                buy_score=signal_score,
+                                                buy_meta=buy_meta,
                                             )
                                             
                                             # 잔고 업데이트
                                             new_balance = self.engine.get_balance("KRW")
-                                            self.stats.update_balance(new_balance)
+                                            new_total_value = self._estimate_total_value(new_balance)
+                                            self.stats.update_balance(new_balance, current_total_value=new_total_value)
                                             
                                             # 로그 기록 (점수 포함)
                                             signal_str = f"{', '.join(signals)} (점수:{signal_score})"
@@ -1609,12 +1924,42 @@ class TradingBot:
                                                 signals,
                                                 new_balance
                                             )
+
+                                            # 분석 로그 (매수 체결)
+                                            self.logger.log_decision(
+                                                "BUY_EXECUTED",
+                                                {
+                                                    "ticker": ticker,
+                                                    "invest_amount_krw": float(invest_amount),
+                                                    "price": float(buy_result.get("price", 0) or 0),
+                                                    "amount": float(buy_result.get("amount", 0) or 0),
+                                                    "fee_krw": float(buy_result.get("fee", 0) or 0),
+                                                    "orderbook": orderbook_details or {},
+                                                    "mid_price": float(mid_price) if mid_price else None,
+                                                    "slippage_bps": (
+                                                        float(buy_result.get("price", 0) or 0) / float(mid_price) - 1.0
+                                                    ) * 10000
+                                                    if mid_price
+                                                    else None,
+                                                    "signals": list(signals),
+                                                    "score": int(signal_score),
+                                                    "meta": buy_meta or {},
+                                                },
+                                            )
                                             
                                             # 수수료 누적(가능하면 실제, 없으면 추정)
                                             self.stats.add_fee(buy_result.get('fee', 0))
                                         else:
                                             # 매수 실패
                                             self.logger.warning(f"⚠️  {ticker} 매수 실패")
+                                            self.logger.log_decision(
+                                                "BUY_FAILED",
+                                                {
+                                                    "ticker": ticker,
+                                                    "invest_amount_krw": float(invest_amount),
+                                                    "meta": buy_meta or {},
+                                                },
+                                            )
                                     
                                     finally:
                                         # 매수 완료 (성공/실패 상관없이 제거)
@@ -1627,9 +1972,24 @@ class TradingBot:
                     elif ticker in self.stats.positions:
                         position = self.stats.positions[ticker]
                         
-                        should_sell, reason, sell_ratio = self.engine.check_sell_signal(ticker, position)
+                        should_sell, reason, sell_ratio, sell_meta = self.engine.check_sell_signal(ticker, position)
                         
                         if should_sell:
+                            self.logger.log_decision(
+                                "SELL_SIGNAL",
+                                {
+                                    "ticker": ticker,
+                                    "reason": reason,
+                                    "sell_ratio": float(sell_ratio),
+                                    "position": {
+                                        "buy_price": float(position.get("buy_price", 0) or 0),
+                                        "amount": float(position.get("amount", 0) or 0),
+                                        "highest_price": float(position.get("highest_price", 0) or 0),
+                                        "timestamp": position.get("timestamp").isoformat() if position.get("timestamp") else None,
+                                    },
+                                    "meta": sell_meta or {},
+                                },
+                            )
                             # 매도 실행 (실제 잔고 기준, locked 자동 제외)
                             sell_result = self.engine.execute_sell(ticker, position, sell_ratio)
                             
@@ -1642,7 +2002,8 @@ class TradingBot:
                                 
                                 # 잔고 업데이트
                                 new_balance = self.engine.get_balance("KRW")
-                                self.stats.update_balance(new_balance)
+                                new_total_value = self._estimate_total_value(new_balance)
+                                self.stats.update_balance(new_balance, current_total_value=new_total_value)
                                 
                                 # 로그 기록
                                 self.logger.log_sell(
@@ -1687,7 +2048,14 @@ class TradingBot:
                                             f"{remaining_amount:.8f} ({remaining_value:,.0f}원)"
                                         )
                                     
-                                    self.stats.remove_position(ticker, sell_result['price'], profit_krw, reason)
+                                    self.stats.remove_position(
+                                        ticker,
+                                        sell_result['price'],
+                                        profit_krw,
+                                        reason,
+                                        sell_fee_krw=sell_result.get('fee', 0),
+                                        sell_meta=sell_meta,
+                                    )
                                     
                                     # 손절이면 동일 종목 재진입 쿨다운 적용
                                     if "손절" in str(reason):
@@ -1717,6 +2085,22 @@ class TradingBot:
                                         f"수익률 {profit_rate:+.2f}% | 손익 {profit_krw:+,.0f}원 | "
                                         f"{reason}"
                                     )
+
+                                    self.logger.log_decision(
+                                        "SELL_EXECUTED",
+                                        {
+                                            "ticker": ticker,
+                                            "reason": reason,
+                                            "sell_ratio": float(sell_ratio),
+                                            "price": float(sell_result.get("price", 0) or 0),
+                                            "amount": float(sell_result.get("amount", 0) or 0),
+                                            "net_krw": float(sell_result.get("total_krw", 0) or 0),
+                                            "fee_krw": float(sell_result.get("fee", 0) or 0),
+                                            "profit_krw": float(profit_krw),
+                                            "profit_rate": float(profit_rate),
+                                            "meta": sell_meta or {},
+                                        },
+                                    )
                                 
                                 else:  # 분할 매도
                                     # 포지션 수량 감소
@@ -1741,7 +2125,14 @@ class TradingBot:
                                         if final_sell:
                                             self.stats.add_fee(final_sell.get('fee', 0))
                                             final_profit = final_sell['total_krw'] - (position['buy_price'] * position['amount'])
-                                            self.stats.remove_position(ticker, final_sell['price'], final_profit, "소액청산")
+                                            self.stats.remove_position(
+                                                ticker,
+                                                final_sell['price'],
+                                                final_profit,
+                                                "소액청산",
+                                                sell_fee_krw=final_sell.get('fee', 0),
+                                                sell_meta={"note": "소액청산"},
+                                            )
                                             
                                             self.logger.info(
                                                 f"  ✅ 소액청산 완료: {ticker} | "

@@ -29,6 +29,8 @@
     "lookback_days": 1,
     "refresh_interval_hours": 1,
     "empty_list_retry_seconds": 60,
+    "_comment_empty_backoff": "거래 가능 종목이 비었을 때 재탐색 백오프 최대값(초). 실패가 반복되면 empty_list_retry_seconds * 2^n 으로 증가",
+    "empty_list_retry_max_seconds": 600,
     "excluded_coins": [
       "BTC",
       "ETH"
@@ -42,6 +44,10 @@
     "_comment_rsi_filter": "RSI 진입 필터: rsi_buy_min <= RSI < rsi_buy_max (과매도 캐치 최소화)",
     "rsi_buy_min": 50,
     "rsi_buy_max": 70,
+    "_comment_entry_quality": "수익/수수료 관점에서 과매매를 줄이기 위한 매수 품질 필터",
+    "require_price_above_ma20": true,
+    "require_strong_trigger": true,
+    "strong_trigger_min_volume_ratio": 1.8,
     "macd_fast": 12,
     "macd_slow": 26,
     "macd_signal": 9,

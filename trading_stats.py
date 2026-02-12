@@ -27,6 +27,7 @@ class TradingStats:
         self.wins = 0
         self.losses = 0
         self.total_profit_krw = 0
+        self.total_profit_after_fees_krw = 0
         self.total_fees = 0
         
         # 코인별 통계
@@ -78,18 +79,29 @@ class TradingStats:
         with self.lock:
             return float(self.total_fees or 0)
     
-    def start(self, initial_balance):
-        """거래 시작"""
+    def start(self, initial_cash_balance, initial_total_value=None):
+        """거래 시작.
+
+        Args:
+            initial_cash_balance: 시작 시점 KRW 현금 잔고
+            initial_total_value: 시작 시점 총자산(현금+포지션 평가액). None이면 initial_cash_balance로 간주
+        """
         with self.lock:
-            self.initial_balance = initial_balance
-            self.current_balance = initial_balance
-            self.peak_balance = initial_balance
-            self.daily_start_balance = initial_balance
+            cash = float(initial_cash_balance or 0)
+            total = float(initial_total_value if initial_total_value is not None else cash)
+
+            # 초기 자금은 "총자산(현금+포지션)" 기준으로 두어 재기동 시 수익률 왜곡을 방지
+            self.initial_balance = total
+            # current_balance는 "현금(KRW)" 기준으로 유지(표시/투자 가능 금액 계산 등에 사용)
+            self.current_balance = cash
+            # MDD는 총자산 기준으로 추적
+            self.peak_balance = total
+            self.daily_start_balance = total
             self.start_time = datetime.now()
             self.last_update = datetime.now()
     
-    def add_position(self, coin, buy_price, amount, uuid=None):
-        """포지션 추가"""
+    def add_position(self, coin, buy_price, amount, uuid=None, buy_fee_krw=0, buy_signals=None, buy_score=0, buy_meta=None):
+        """포지션 추가 (매수 메타/수수료 포함)"""
         with self.lock:
             self.positions[coin] = {
                 'buy_price': buy_price,
@@ -97,7 +109,11 @@ class TradingStats:
                 'original_amount': amount,  # 원래 매수 수량 저장
                 'timestamp': datetime.now(),
                 'highest_price': buy_price,
-                'uuid': uuid  # 주문 UUID 저장
+                'uuid': uuid,  # 주문 UUID 저장
+                'buy_fee_krw': float(buy_fee_krw or 0),
+                'buy_signals': list(buy_signals) if buy_signals else [],
+                'buy_score': int(buy_score or 0),
+                'buy_meta': buy_meta if isinstance(buy_meta, dict) else {},
             }
             self.save_positions()  # 포지션 저장
     
@@ -109,8 +125,8 @@ class TradingStats:
                     self.positions[coin]['highest_price'] = current_price
                     self.save_positions()  # 변경 사항 저장
     
-    def remove_position(self, coin, sell_price, profit_krw, reason):
-        """포지션 제거 및 통계 업데이트"""
+    def remove_position(self, coin, sell_price, profit_krw, reason, sell_fee_krw=0, sell_meta=None):
+        """포지션 제거 및 통계 업데이트 (수수료/메타 포함)"""
         with self.lock:
             if coin not in self.positions:
                 return
@@ -118,6 +134,9 @@ class TradingStats:
             position = self.positions[coin]
             buy_price = position['buy_price']
             profit_rate = ((sell_price - buy_price) / buy_price) * 100
+            buy_fee_krw = float(position.get('buy_fee_krw', 0) or 0)
+            sell_fee_krw = float(sell_fee_krw or 0)
+            profit_after_fees_krw = float(profit_krw) - buy_fee_krw
             
             # 거래 기록 저장
             now = datetime.now()
@@ -129,8 +148,17 @@ class TradingStats:
                 'amount': position['amount'],
                 'profit_rate': profit_rate,
                 'profit_krw': profit_krw,
+                'buy_fee_krw': buy_fee_krw,
+                'sell_fee_krw': sell_fee_krw,
+                'total_fee_krw': buy_fee_krw + sell_fee_krw,
+                'profit_after_fees_krw': profit_after_fees_krw,
                 'reason': reason,
-                'holding_time': (now - position['timestamp']).total_seconds()
+                'holding_time': (now - position['timestamp']).total_seconds(),
+                'buy_signals': position.get('buy_signals', []),
+                'buy_score': position.get('buy_score', 0),
+                'buy_meta': position.get('buy_meta', {}),
+                'sell_meta': sell_meta if isinstance(sell_meta, dict) else {},
+                'uuid': position.get('uuid'),
             }
             
             # 메모리에 저장
@@ -142,8 +170,9 @@ class TradingStats:
             # 통계 업데이트
             self.total_trades += 1
             self.total_profit_krw += profit_krw
+            self.total_profit_after_fees_krw += profit_after_fees_krw
             
-            if profit_krw > 0:
+            if profit_after_fees_krw > 0:
                 self.wins += 1
                 self.coin_stats[coin]['wins'] += 1
             else:
@@ -151,7 +180,7 @@ class TradingStats:
                 self.coin_stats[coin]['losses'] += 1
             
             self.coin_stats[coin]['trades'] += 1
-            self.coin_stats[coin]['profit_krw'] += profit_krw
+            self.coin_stats[coin]['profit_krw'] += profit_after_fees_krw
             
             # 포지션 제거
             del self.positions[coin]
@@ -159,18 +188,24 @@ class TradingStats:
             
             self.last_update = now
     
-    def update_balance(self, current_balance):
-        """잔고 업데이트 및 MDD 계산"""
+    def update_balance(self, current_cash_balance, current_total_value=None):
+        """잔고 업데이트 및 MDD 계산.
+
+        current_total_value를 전달하면(현금+포지션 평가액), MDD를 총자산 기준으로 계산합니다.
+        """
         with self.lock:
-            self.current_balance = current_balance
+            cash = float(current_cash_balance or 0)
+            total = float(current_total_value if current_total_value is not None else cash)
+
+            self.current_balance = cash
             
-            # 최고점 갱신
-            if current_balance > self.peak_balance:
-                self.peak_balance = current_balance
+            # 최고점 갱신 (총자산 기준)
+            if total > self.peak_balance:
+                self.peak_balance = total
             
             # MDD 계산
             if self.peak_balance > 0:
-                drawdown = ((current_balance - self.peak_balance) / self.peak_balance) * 100
+                drawdown = ((total - self.peak_balance) / self.peak_balance) * 100
                 if drawdown < self.max_drawdown:
                     self.max_drawdown = drawdown
             
@@ -207,6 +242,9 @@ class TradingStats:
             
             # 평균 수익
             avg_profit = self.total_profit_krw / self.total_trades if self.total_trades > 0 else 0
+            avg_profit_after_fees = (
+                self.total_profit_after_fees_krw / self.total_trades if self.total_trades > 0 else 0
+            )
             
             # 거래 시간
             if self.start_time:
@@ -221,12 +259,14 @@ class TradingStats:
                 'total_value': total_value,
                 'total_return': total_return,
                 'total_profit_krw': self.total_profit_krw,
+                'total_profit_after_fees_krw': self.total_profit_after_fees_krw,
                 'total_fees_krw': self.total_fees,
                 'total_trades': self.total_trades,
                 'wins': self.wins,
                 'losses': self.losses,
                 'win_rate': win_rate,
                 'avg_profit': avg_profit,
+                'avg_profit_after_fees': avg_profit_after_fees,
                 'max_drawdown': self.max_drawdown,
                 'positions': position_details,
                 'trading_hours': hours,
@@ -274,7 +314,11 @@ class TradingStats:
                     'original_amount': pos['original_amount'],
                     'timestamp': pos['timestamp'].isoformat(),
                     'highest_price': pos['highest_price'],
-                    'uuid': pos.get('uuid')
+                    'uuid': pos.get('uuid'),
+                    'buy_fee_krw': pos.get('buy_fee_krw', 0),
+                    'buy_signals': pos.get('buy_signals', []),
+                    'buy_score': pos.get('buy_score', 0),
+                    'buy_meta': pos.get('buy_meta', {}),
                 }
             
             with open(self.position_file, 'w') as f:
@@ -299,7 +343,11 @@ class TradingStats:
                     'original_amount': pos['original_amount'],
                     'timestamp': datetime.fromisoformat(pos['timestamp']),
                     'highest_price': pos['highest_price'],
-                    'uuid': pos.get('uuid')
+                    'uuid': pos.get('uuid'),
+                    'buy_fee_krw': float(pos.get('buy_fee_krw', 0) or 0),
+                    'buy_signals': pos.get('buy_signals', []),
+                    'buy_score': int(pos.get('buy_score', 0) or 0),
+                    'buy_meta': pos.get('buy_meta', {}) if isinstance(pos.get('buy_meta'), dict) else {},
                 }
             
             return positions
@@ -370,6 +418,9 @@ class TradingStats:
                 all_trades[t['timestamp'].isoformat()] = t
             
             # 총 손익 계산
-            total_profit = sum(t['profit_krw'] for t in all_trades.values())
+            total_profit = sum(
+                float(t.get('profit_after_fees_krw', t.get('profit_krw', 0)) or 0)
+                for t in all_trades.values()
+            )
             
             return total_profit, len(all_trades)

@@ -37,6 +37,7 @@ class CoinSelector:
         try:
             tickers = pyupbit.get_tickers(fiat="KRW")
             coin_data = []
+            coin_data_in_rsi_range = []
             
             for ticker in tickers:
                 try:
@@ -92,17 +93,19 @@ class CoinSelector:
                         rsi_slope = float(current_rsi - rsi.iloc[-11])  # 10분 변화량
                     except Exception:
                         rsi_slope = 0.0
-
-                    # RSI 진입 범위 필터 (과매도 캐치 제거)
-                    if pd.isna(current_rsi) or current_rsi < self.rsi_buy_min or current_rsi >= self.rsi_buy_max:
-                        continue
+                    rsi_in_range = (not pd.isna(current_rsi)) and (self.rsi_buy_min <= current_rsi < self.rsi_buy_max)
                     
                     # 점수 계산
                     score = self._calculate_score(
                         volume_krw, volatility, volume_trend, bb_width, current_rsi, rsi_slope
                     )
+                    # RSI 진입 범위에 드는 코인을 우선 선정하되, 전혀 없으면(또는 부족하면) 완화하여 선정
+                    if rsi_in_range:
+                        score += 15  # 우선순위 가점
+                    else:
+                        score -= 10  # 범위 밖이면 감점 (완전히 배제하진 않음)
                     
-                    coin_data.append({
+                    record = {
                         'ticker': ticker,
                         'name': ticker.replace("KRW-", ""),
                         'price': current_price,
@@ -111,18 +114,35 @@ class CoinSelector:
                         'volume_trend': volume_trend,
                         'bb_width': bb_width,
                         'rsi': current_rsi,
+                        'rsi_in_range': rsi_in_range,
                         'score': score
-                    })
+                    }
+                    coin_data.append(record)
+                    if rsi_in_range:
+                        coin_data_in_rsi_range.append(record)
                     
                 except Exception as e:
                     continue
             
             if not coin_data:
-                self.logger.warning("⚠️  조건에 맞는 코인이 없습니다.")
+                self.logger.warning("⚠️  조건에 맞는 코인이 없습니다. (데이터 수집 실패 가능)")
                 return []
-            
+
+            # RSI 범위 후보가 충분하면 우선 사용, 부족하면 완화 후보 사용
+            selected_pool = coin_data_in_rsi_range if len(coin_data_in_rsi_range) >= max_coins else coin_data
+            if selected_pool is coin_data and coin_data_in_rsi_range:
+                self.logger.info(
+                    f"ℹ️ RSI {self.rsi_buy_min:.0f}~{self.rsi_buy_max:.0f} 후보가 부족하여 "
+                    f"일부 범위 밖 코인도 포함해 선정합니다. (in-range {len(coin_data_in_rsi_range)}/{len(coin_data)})"
+                )
+            elif selected_pool is coin_data and not coin_data_in_rsi_range:
+                self.logger.info(
+                    f"ℹ️ RSI {self.rsi_buy_min:.0f}~{self.rsi_buy_max:.0f} 후보가 없어 "
+                    f"RSI 조건을 완화하여 선정합니다."
+                )
+
             # 점수 순으로 정렬
-            df = pd.DataFrame(coin_data)
+            df = pd.DataFrame(selected_pool)
             df = df.sort_values('score', ascending=False)
             
             # 상위 코인 선정
@@ -141,7 +161,7 @@ class CoinSelector:
                     f"가격: {row['price']:,.0f}원 | "
                     f"거래량: {row['volume_krw']/100000000:.0f}억 | "
                     f"변동성: {row['volatility']:.2f}% | "
-                    f"RSI: {row['rsi']:.1f} | "
+                    f"RSI: {row['rsi']:.1f}{'✅' if row.get('rsi_in_range') else ''} | "
                     f"점수: {row['score']:.1f}"
                 )
             

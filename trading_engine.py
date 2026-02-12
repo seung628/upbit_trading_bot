@@ -80,6 +80,17 @@ class TradingEngine:
             self.rsi_buy_max = float(config.get('indicators', {}).get('rsi_buy_max', 70))
         except Exception:
             self.rsi_buy_max = 70.0
+
+        # 매수 품질 필터(과매매/수수료 드래그 완화 목적)
+        ind_cfg = config.get('indicators', {}) or {}
+        val = ind_cfg.get('require_price_above_ma20', True)
+        self.require_price_above_ma20 = True if val is None else bool(val)
+        val = ind_cfg.get('require_strong_trigger', True)
+        self.require_strong_trigger = True if val is None else bool(val)
+        try:
+            self.strong_trigger_min_volume_ratio = float(ind_cfg.get('strong_trigger_min_volume_ratio', 1.8))
+        except Exception:
+            self.strong_trigger_min_volume_ratio = 1.8
         
         # pyupbit Remaining-Req 파싱 오류 우회 패치
         self._patch_pyupbit_remaining_req_parser()
@@ -124,33 +135,43 @@ class TradingEngine:
         try:
             orderbook = pyupbit.get_orderbook(ticker)
             if not orderbook or 'orderbook_units' not in orderbook:
-                return False, "호가 정보 없음"
+                return False, "호가 정보 없음", {"ticker": ticker}
             
             units = orderbook['orderbook_units'][0]
             ask_price = units['ask_price']  # 매도 1호가
             bid_price = units['bid_price']  # 매수 1호가
             ask_size = units['ask_size']    # 매도 잔량
             bid_size = units['bid_size']    # 매수 잔량
+            details = {
+                "ticker": ticker,
+                "ask_price": float(ask_price),
+                "bid_price": float(bid_price),
+                "ask_size": float(ask_size),
+                "bid_size": float(bid_size),
+            }
             
             # 스프레드 체크
             spread_pct = ((ask_price - bid_price) / bid_price) * 100
+            details["spread_pct"] = float(spread_pct)
             if spread_pct > self.max_spread_pct:
-                return False, f"스프레드 과다({spread_pct:.2f}%)"
+                return False, f"스프레드 과다({spread_pct:.2f}%)", details
             
             # 호가 잔량 체크 (매수/매도 모두)
             bid_depth_krw = bid_price * bid_size
             ask_depth_krw = ask_price * ask_size
+            details["bid_depth_krw"] = float(bid_depth_krw)
+            details["ask_depth_krw"] = float(ask_depth_krw)
             
             if bid_depth_krw < self.min_orderbook_depth:
-                return False, f"매수호가 부족({bid_depth_krw:,.0f}원)"
+                return False, f"매수호가 부족({bid_depth_krw:,.0f}원)", details
             
             if ask_depth_krw < self.min_orderbook_depth:
-                return False, f"매도호가 부족({ask_depth_krw:,.0f}원)"
+                return False, f"매도호가 부족({ask_depth_krw:,.0f}원)", details
             
-            return True, "안전"
+            return True, "안전", details
             
         except Exception as e:
-            return False, f"호가 체크 오류: {e}"
+            return False, f"호가 체크 오류: {e}", {"ticker": ticker, "error": f"{type(e).__name__}: {e}"}
     
     def connect(self, access_key, secret_key):
         """업비트 API 연결"""
@@ -251,26 +272,63 @@ class TradingEngine:
             df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
             if df is None or len(df) < 50:
                 self.logger.debug(f"  {ticker} 데이터 부족")
-                return False, ["데이터부족"], None, 0
+                return False, ["데이터부족"], None, 0, {"blocked_by": ["데이터부족"]}
             
             df = self.calculate_indicators(df)
             
             # 확정 봉만 사용 (iloc[-2])
             current = df.iloc[-2]  # 마감된 직전 봉
             prev = df.iloc[-3]
+            candle_ts = None
+            try:
+                candle_ts = str(getattr(current, "name", "") or "")
+            except Exception:
+                candle_ts = None
 
             # RSI 범위 필터: 최근 데이터 기준으로는 RSI<40(특히 <35) 구간 진입이 손익/승률 모두 악화되는 경향
             rsi_value = current.get('rsi')
             if pd.isna(rsi_value):
                 self.logger.debug(f"  {ticker} ❌ RSI 데이터 없음")
-                return False, ["RSI없음"], current['close'], 0
+                return False, ["RSI없음"], current['close'], 0, {"blocked_by": ["RSI없음"], "candle_ts": candle_ts}
 
             if rsi_value < self.rsi_buy_min or rsi_value >= self.rsi_buy_max:
                 self.logger.debug(
                     f"  {ticker} ❌ RSI 범위 아님 ({rsi_value:.1f}, "
                     f"{self.rsi_buy_min:.0f}~{self.rsi_buy_max:.0f})"
                 )
-                return False, [f"RSI({rsi_value:.1f})"], current['close'], 0
+                return False, [f"RSI({rsi_value:.1f})"], current['close'], 0, {
+                    "blocked_by": ["RSI필터"],
+                    "rsi": float(rsi_value),
+                    "rsi_buy_min": float(self.rsi_buy_min),
+                    "rsi_buy_max": float(self.rsi_buy_max),
+                    "candle_ts": candle_ts,
+                }
+
+            blocked_by = []
+            meta = {
+                "ticker": ticker,
+                "interval": "minute1",
+                "candle_ts": candle_ts,
+                "close": float(current.get("close", 0) or 0),
+                "prev_close": float(prev.get("close", 0) or 0),
+                "rsi": float(rsi_value),
+                "prev_rsi": float(prev.get("rsi", 0) or 0) if not pd.isna(prev.get("rsi")) else None,
+                "ma5": float(current.get("ma5", 0) or 0) if not pd.isna(current.get("ma5")) else None,
+                "ma20": float(current.get("ma20", 0) or 0) if not pd.isna(current.get("ma20")) else None,
+                "bb_lower": float(current.get("bb_lower", 0) or 0) if not pd.isna(current.get("bb_lower")) else None,
+                "bb_upper": float(current.get("bb_upper", 0) or 0) if not pd.isna(current.get("bb_upper")) else None,
+                "macd": float(current.get("macd", 0) or 0) if not pd.isna(current.get("macd")) else None,
+                "macd_signal": float(current.get("macd_signal", 0) or 0) if not pd.isna(current.get("macd_signal")) else None,
+                "volume": float(current.get("volume", 0) or 0) if not pd.isna(current.get("volume")) else None,
+                "volume_ma": float(current.get("volume_ma", 0) or 0) if not pd.isna(current.get("volume_ma")) else None,
+                "filters": {
+                    "rsi_buy_min": float(self.rsi_buy_min),
+                    "rsi_buy_max": float(self.rsi_buy_max),
+                    "require_price_above_ma20": bool(self.require_price_above_ma20),
+                    "require_strong_trigger": bool(self.require_strong_trigger),
+                    "strong_trigger_min_volume_ratio": float(self.strong_trigger_min_volume_ratio),
+                },
+            }
             
             # 추세 확인 (횡보장 필터링)
             if self.check_trend:
@@ -279,14 +337,21 @@ class TradingEngine:
                 
                 if pd.isna(ma20_current) or pd.isna(ma20_old):
                     self.logger.debug(f"  {ticker} ❌ MA20 데이터 없음")
-                    return False, ["MA20없음"], None, 0
+                    return False, ["MA20없음"], None, 0, {
+                        **meta,
+                        "blocked_by": ["MA20없음"],
+                    }
                 
                 trend_slope = (ma20_current - ma20_old) / ma20_old
                 
                 # 추세가 너무 약하면 거래 안 함 (횡보장)
                 if abs(trend_slope) < self.min_trend_strength:
                     self.logger.debug(f"  {ticker} ❌ 횡보장 (기울기 {trend_slope*100:.2f}% < {self.min_trend_strength*100}%)")
-                    return False, [f"횡보장({trend_slope*100:.2f}%)"], None, 0
+                    return False, [f"횡보장({trend_slope*100:.2f}%)"], None, 0, {
+                        **meta,
+                        "blocked_by": ["횡보장"],
+                        "ma20_slope": float(trend_slope),
+                    }
             
             # 신호 수집 및 점수 계산
             signals = []
@@ -314,6 +379,7 @@ class TradingEngine:
             
             # 신호 3: 거래량 급증 (3점 - 강함)
             volume_ratio = current['volume'] / current['volume_ma']
+            meta["volume_ratio"] = float(volume_ratio) if not pd.isna(volume_ratio) else None
             if volume_ratio > 2.0:
                 signals.append("거래량폭증")
                 signal_details.append(f"✅ 거래량폭증(3점, {volume_ratio:.1f}배)")
@@ -326,7 +392,9 @@ class TradingEngine:
                 signal_details.append(f"❌ 거래량급증(미충족, {volume_ratio:.1f}배)")
             
             # 신호 4: MACD 골든크로스 (3점 - 강함)
-            if prev['macd'] <= prev['macd_signal'] and current['macd'] > current['macd_signal']:
+            macd_cross = prev['macd'] <= prev['macd_signal'] and current['macd'] > current['macd_signal']
+            meta["macd_golden_cross"] = bool(macd_cross)
+            if macd_cross:
                 signals.append("MACD골든크로스")
                 signal_details.append("✅ MACD골든크로스(3점)")
                 total_score += 3
@@ -342,7 +410,9 @@ class TradingEngine:
                 signal_details.append("❌ MA5상승(미충족)")
 
             # 신호 5.5: 가격이 MA20 위 (2점) - 추세/모멘텀 필터
-            if not pd.isna(current['ma20']) and current['close'] > current['ma20']:
+            price_above_ma20 = (not pd.isna(current['ma20'])) and current['close'] > current['ma20']
+            meta["price_above_ma20"] = bool(price_above_ma20)
+            if price_above_ma20:
                 signals.append("가격>MA20")
                 signal_details.append("✅ 가격>MA20(2점)")
                 total_score += 2
@@ -358,6 +428,22 @@ class TradingEngine:
                     total_score += 2
                 else:
                     signal_details.append(f"❌ BB하위(미충족, {bb_position*100:.0f}%)")
+                meta["bb_position"] = float(bb_position)
+
+            # 품질 필터 1: 가격이 MA20 위에 있어야만 진입 (칼날 잡기 방지)
+            if self.require_price_above_ma20 and not price_above_ma20:
+                blocked_by.append("가격<MA20")
+
+            # 품질 필터 2: 강한 트리거(거래량 or MACD) 없으면 스킵 (과매매/수수료 드래그 완화)
+            if self.require_strong_trigger:
+                strong_volume = (volume_ratio is not None) and (volume_ratio >= self.strong_trigger_min_volume_ratio)
+                if (not strong_volume) and (not macd_cross):
+                    blocked_by.append("강한트리거없음")
+
+            if blocked_by:
+                meta["blocked_by"] = blocked_by
+                self.logger.debug(f"  {ticker} ❌ 매수 품질 필터로 스킵: {', '.join(blocked_by)}")
+                return False, signals, current['close'], total_score, meta
             
             # 로그 출력
             if len(signals) > 0 or total_score > 0:
@@ -369,23 +455,35 @@ class TradingEngine:
             if self.use_signal_scoring:
                 if total_score >= self.min_signal_score:
                     self.logger.info(f"  {ticker} ✅ 매수 조건 충족! (점수: {total_score}점)")
-                    return True, signals, current['close'], total_score
+                    meta["blocked_by"] = []
+                    meta["score"] = int(total_score)
+                    meta["signals"] = list(signals)
+                    return True, signals, current['close'], total_score, meta
                 else:
                     self.logger.debug(f"  {ticker} ❌ 점수 부족 ({total_score}점 < {self.min_signal_score}점)")
-                    return False, signals, current['close'], total_score
+                    meta["blocked_by"] = ["점수부족"]
+                    meta["score"] = int(total_score)
+                    meta["signals"] = list(signals)
+                    return False, signals, current['close'], total_score, meta
             
             # 기존 방식 (신호 개수)
             if len(signals) >= self.min_signals:
                 self.logger.info(f"  {ticker} ✅ 매수 조건 충족! (신호: {len(signals)}개)")
-                return True, signals, current['close'], total_score
+                meta["blocked_by"] = []
+                meta["score"] = int(total_score)
+                meta["signals"] = list(signals)
+                return True, signals, current['close'], total_score, meta
             else:
                 self.logger.debug(f"  {ticker} ❌ 신호 부족 ({len(signals)}개 < {self.min_signals}개)")
             
-            return False, signals, current['close'], total_score
+            meta["blocked_by"] = ["신호부족"]
+            meta["score"] = int(total_score)
+            meta["signals"] = list(signals)
+            return False, signals, current['close'], total_score, meta
             
         except Exception as e:
             self.logger.log_error(f"{ticker} 매수 신호 확인 오류", e)
-            return False, [], None, 0
+            return False, [], None, 0, {"blocked_by": ["예외"], "error": f"{type(e).__name__}: {e}"}
     
     def check_sell_signal(self, ticker, position):
         """매도 신호 확인"""
@@ -393,12 +491,20 @@ class TradingEngine:
         try:
             df = pyupbit.get_ohlcv(ticker, interval="minute1", count=200)
             if df is None:
-                return False, "HOLD", 1.0
+                return False, "HOLD", 1.0, {"blocked_by": ["데이터없음"]}
             
             df = self.calculate_indicators(df)
-            current = df.iloc[-1]
-            
-            current_price = current['close']
+            # 확정 봉 기반 지표(노이즈로 인한 잦은 매도 방지)
+            current = df.iloc[-2]
+            prev = df.iloc[-3]
+
+            current_price = pyupbit.get_current_price(ticker)
+            if current_price is None:
+                try:
+                    current_price = float(df.iloc[-1].get("close", current.get("close", 0)) or current.get("close", 0))
+                except Exception:
+                    current_price = float(current.get("close", 0) or 0)
+
             buy_price = position['buy_price']
             highest_price = position['highest_price']
             current_atr = current['atr']
@@ -409,11 +515,28 @@ class TradingEngine:
                 self.stats.update_position_highest(ticker, highest_price)
             
             profit_rate = (current_price - buy_price) / buy_price
+
+            meta = {
+                "ticker": ticker,
+                "interval": "minute1",
+                "current_price": float(current_price),
+                "indicator_close": float(current.get("close", 0) or 0),
+                "buy_price": float(buy_price),
+                "highest_price": float(highest_price),
+                "profit_rate": float(profit_rate),
+                "rsi": float(current.get("rsi", 0) or 0) if not pd.isna(current.get("rsi")) else None,
+                "bb_lower": float(current.get("bb_lower", 0) or 0) if not pd.isna(current.get("bb_lower")) else None,
+                "bb_upper": float(current.get("bb_upper", 0) or 0) if not pd.isna(current.get("bb_upper")) else None,
+                "atr": float(current_atr) if not pd.isna(current_atr) else None,
+                "sold_ratio": None,
+                "reason": None,
+            }
             
             # 이미 매도한 비율 계산
             original_amount = position.get('original_amount', position['amount'])
             current_amount = position['amount']
             sold_ratio = 1.0 - (current_amount / original_amount) if original_amount > 0 else 0
+            meta["sold_ratio"] = float(sold_ratio)
             
             # ATR 기반 손절/익절 계산 (ATR 사용 시)
             if self.use_atr and not pd.isna(current_atr) and current_atr > 0:
@@ -426,53 +549,71 @@ class TradingEngine:
                     effective_sl_rate = min(atr_sl_rate, self.min_atr_stop_loss)  # 더 타이트하면(min_atr_stop_loss)로 완화
                     atr_stop_loss = buy_price * (1 + effective_sl_rate)
                 atr_take_profit = buy_price + (current_atr * self.atr_tp_multiplier)
+                meta["atr_stop_loss"] = float(atr_stop_loss)
+                meta["atr_take_profit"] = float(atr_take_profit)
                 
                 # ATR 기반 손절 (가격 기준)
                 if current_price <= atr_stop_loss:
                     atr_loss_pct = ((current_price - buy_price) / buy_price) * 100
-                    return True, f"ATR손절({atr_loss_pct:.2f}%)", 1.0
+                    reason = f"ATR손절({atr_loss_pct:.2f}%)"
+                    meta["reason"] = reason
+                    return True, reason, 1.0, meta
                 
                 # ATR 기반 익절 (가격 기준)
                 if current_price >= atr_take_profit and profit_rate > 0.01:
-                    return True, f"ATR익절({profit_rate*100:.2f}%)", 1.0
+                    reason = f"ATR익절({profit_rate*100:.2f}%)"
+                    meta["reason"] = reason
+                    return True, reason, 1.0, meta
             
             # 1. 고정 % 손절 (폴백)
             if profit_rate <= self.stop_loss:
-                return True, f"손절({profit_rate*100:.2f}%)", 1.0
+                reason = f"손절({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, 1.0, meta
             
             # 2. BB 하단 추가 이탈
             if current_price < current['bb_lower'] * 0.995:
-                return True, f"BB하단이탈({profit_rate*100:.2f}%)", 1.0
+                reason = f"BB하단이탈({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, 1.0, meta
             
             # 3. 트레일링 스탑
             if profit_rate > self.trailing_activation:
                 trailing_loss = (current_price - highest_price) / highest_price
                 if trailing_loss <= -self.trailing_stop:
-                    return True, f"트레일링스탑({profit_rate*100:.2f}%)", 1.0
+                    reason = f"트레일링스탑({profit_rate*100:.2f}%)"
+                    meta["reason"] = reason
+                    return True, reason, 1.0, meta
             
             # 4. 분할 익절 1차 (아직 1차 익절을 안 했을 때만)
             if profit_rate >= self.take_profit_1 and sold_ratio < 0.1:
-                return True, f"1차익절({profit_rate*100:.2f}%)", \
-                       self.config['risk_management']['take_profit_1_ratio']
+                reason = f"1차익절({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, self.config['risk_management']['take_profit_1_ratio'], meta
             
             # 5. 분할 익절 2차 (1차는 했고 2차는 안 했을 때만)
             if profit_rate >= self.take_profit_2 and sold_ratio >= 0.4 and sold_ratio < 0.7:
-                return True, f"2차익절({profit_rate*100:.2f}%)", \
-                       self.config['risk_management']['take_profit_2_ratio']
+                reason = f"2차익절({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, self.config['risk_management']['take_profit_2_ratio'], meta
             
             # 6. BB 상단 도달
             if current_price >= current['bb_upper'] * 0.98 and profit_rate > 0.01:
-                return True, f"BB상단({profit_rate*100:.2f}%)", 1.0
+                reason = f"BB상단({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, 1.0, meta
             
             # 7. RSI 과매수
             if current['rsi'] > 70 and profit_rate > 0.015:
-                return True, f"RSI과매수({profit_rate*100:.2f}%)", 1.0
+                reason = f"RSI과매수({profit_rate*100:.2f}%)"
+                meta["reason"] = reason
+                return True, reason, 1.0, meta
             
-            return False, "HOLD", 1.0
+            return False, "HOLD", 1.0, meta
             
         except Exception as e:
             self.logger.log_error(f"{ticker} 매도 신호 확인 오류", e)
-            return False, "ERROR", 1.0
+            return False, "ERROR", 1.0, {"blocked_by": ["예외"], "error": f"{type(e).__name__}: {e}"}
     
     def execute_buy(self, ticker, invest_amount):
         """매수 실행 - 지정가 우선, 부분체결 안전 처리"""

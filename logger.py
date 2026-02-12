@@ -25,6 +25,9 @@ class TradingLogger:
         
         # 통계 로거 설정
         self.stats_logger = self._setup_stats_logger()
+
+        # 의사결정/분석 전용 로거(JSONL)
+        self.decision_logger = self._setup_decision_logger()
     
     def _setup_main_logger(self):
         """메인 시스템 로거"""
@@ -103,6 +106,42 @@ class TradingLogger:
         logger.addHandler(stats_handler)
         
         return logger
+
+    def _setup_decision_logger(self):
+        """의사결정/분석 전용 로거(JSONL)."""
+        logger = logging.getLogger('DecisionLog')
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        decision_handler = TimedRotatingFileHandler(
+            filename=os.path.join(self.log_dir, 'decisions.log'),
+            when='D',
+            interval=1,
+            backupCount=30,
+            encoding='utf-8'
+        )
+        decision_format = logging.Formatter('%(message)s')
+        decision_handler.setFormatter(decision_format)
+
+        logger.addHandler(decision_handler)
+        return logger
+
+    def log_decision(self, event, payload=None):
+        """의사결정/거래 이벤트(JSONL) 기록.
+
+        event: 문자열 (예: BUY_SIGNAL, BUY_EXECUTED, SELL_SIGNAL, SELL_EXECUTED, COIN_REFRESH ...)
+        payload: dict (JSON 직렬화 가능한 값)
+        """
+        try:
+            record = {
+                "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "event": str(event),
+                "payload": payload or {},
+            }
+            self.decision_logger.info(json.dumps(record, ensure_ascii=False))
+        except Exception:
+            # 분석 로그는 실패해도 트레이딩에 영향 주지 않도록 무시
+            pass
     
     def log_buy(self, coin, price, amount, total_krw, fee, signals, balance_krw):
         """매수 로그"""
