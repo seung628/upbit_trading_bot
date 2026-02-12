@@ -16,6 +16,7 @@ from trading_stats import TradingStats
 from coin_selector import CoinSelector
 from trading_engine import TradingEngine
 from telegram_notifier import TelegramNotifier
+from version import BOT_NAME, BOT_DISPLAY_NAME, BOT_VERSION
 
 
 class TradingBot:
@@ -30,6 +31,9 @@ class TradingBot:
         self.coin_selector = CoinSelector(self.config, self.logger)
         self.engine = TradingEngine(self.config, self.logger, self.stats)
         self.telegram = TelegramNotifier(self.config)
+        self.bot_name = BOT_NAME
+        self.bot_display_name = BOT_DISPLAY_NAME
+        self.bot_version = BOT_VERSION
         
         # 상태 변수
         self.is_running = False
@@ -48,9 +52,19 @@ class TradingBot:
         self.buy_amount_krw = self.config['trading']['buy_amount_krw']
         self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
         self.dynamic_allocation = self.config['trading'].get('dynamic_allocation', False)
+        self.auto_start_on_launch = self.config['trading'].get('auto_start_on_launch', True)
         self.check_interval = self.config['trading']['check_interval_seconds']
         self.refresh_interval_hours = self.config['coin_selection'].get('refresh_interval_hours', 1)
         self.empty_list_retry_seconds = self.config['coin_selection'].get('empty_list_retry_seconds', 60)
+        
+        # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
+        try:
+            self.reentry_cooldown_after_stoploss_minutes = int(
+                self.config['trading'].get('reentry_cooldown_after_stoploss_minutes', 0) or 0
+            )
+        except Exception:
+            self.reentry_cooldown_after_stoploss_minutes = 0
+        self.reentry_cooldowns = {}  # ticker -> datetime(until)
         
         # 일일 손실 제한
         self.daily_loss_limit = self.config['trading'].get('daily_loss_limit_percent', -5.0)
@@ -77,7 +91,7 @@ class TradingBot:
             return
         
         self.logger.info("="*80)
-        self.logger.info("🚀 업비트 자동매매 봇 시작")
+        self.logger.info(f"🚀 {self.bot_display_name} 시작 (v{self.bot_version})")
         self.logger.info("="*80)
         
         # API 연결
@@ -152,7 +166,12 @@ class TradingBot:
         self._print_trading_conditions()
         
         # 텔레그램 알림
-        self.telegram.notify_start()
+        self.telegram.notify_start(
+            bot_name=self.bot_name,
+            bot_version=self.bot_version,
+            display_name=self.bot_display_name,
+            selected_coins=self.target_coins
+        )
         
         # 텔레그램 명령어 수신 시작
         if self.telegram.enable_commands:
@@ -245,6 +264,30 @@ class TradingBot:
         """예외 종목(수동 관리) 여부 확인"""
         symbol = self._to_symbol(ticker_or_symbol)
         return symbol in self.protected_coins
+    
+    def _is_reentry_cooldown_active(self, ticker):
+        """손절 직후 같은 종목 재진입(재매수) 방지"""
+        until = self.reentry_cooldowns.get(ticker)
+        if not until:
+            return False
+        
+        if datetime.now() >= until:
+            self.reentry_cooldowns.pop(ticker, None)
+            return False
+        
+        return True
+    
+    def _set_reentry_cooldown(self, ticker, minutes, reason=""):
+        """손절 이후 동일 종목 재진입 쿨다운 설정"""
+        if minutes <= 0:
+            return
+        
+        until = datetime.now() + timedelta(minutes=minutes)
+        self.reentry_cooldowns[ticker] = until
+        self.logger.info(
+            f"⏳ 재진입 쿨다운 설정: {ticker} | {minutes}분 | 사유: {reason} | "
+            f"해제: {until.strftime('%H:%M:%S')}"
+        )
     
     def _sync_untracked_balances(self):
         """스냅샷에 없는 실제 잔고를 설정에 따라 편입/정리"""
@@ -445,6 +488,10 @@ class TradingBot:
             # /help - 도움말
             elif cmd == '/help' or cmd == '/도움말':
                 self._telegram_help()
+            
+            # /version - 버전 정보
+            elif cmd == '/version' or cmd == '/버전':
+                self._telegram_version()
             
             else:
                 self.telegram.send_message(
@@ -665,10 +712,22 @@ class TradingBot:
 /pause - 일시 정지
 /resume - 거래 재개
 
+ℹ️ <b>기타</b>
+/version - 버전 정보
+
 ❓ /help - 이 도움말
 """
         
         self.telegram.send_message(message)
+    
+    def _telegram_version(self):
+        """텔레그램: 버전 정보"""
+        self.telegram.send_message(
+            f"ℹ️ <b>버전 정보</b>\n\n"
+            f"이름: {self.bot_display_name}\n"
+            f"코드명: {self.bot_name}\n"
+            f"버전: v{self.bot_version}"
+        )
     
     def status(self):
         """현재 상태 표시"""
@@ -970,8 +1029,8 @@ class TradingBot:
         
         return investment
     
-    def _refresh_coin_list(self):
-        """코인 목록 갱신 (기존 포지션은 유지)"""
+    def _refresh_coin_list(self, reason="auto"):
+        """코인 목록 갱신 (기존 포지션은 유지). reason='hourly'면 텔레그램 알림 전송"""
         
         self.logger.info("🔄 코인 목록 갱신 시작")
         
@@ -980,11 +1039,18 @@ class TradingBot:
         
         if not new_coins:
             self.logger.warning("⚠️  새로운 코인 선정 실패, 기존 목록 유지")
+            if reason == "hourly":
+                self.telegram.send_message(
+                    "⚠️ <b>1시간 자동 종목 갱신 실패</b>\n\n"
+                    "조건에 맞는 코인이 없어 기존 목록을 유지합니다."
+                )
             return
         
         old_coins = set(self.target_coins)
         new_coins_set = set(new_coins)
+        added_coins = new_coins_set - old_coins
         removed_coins = old_coins - new_coins_set
+        kept_coins = old_coins & new_coins_set
         
         if removed_coins:
             self.logger.info(
@@ -996,6 +1062,28 @@ class TradingBot:
         self.last_coin_refresh = datetime.now()
         
         self.logger.info(f"✅ 코인 목록 갱신 완료: {', '.join([c.replace('KRW-', '') for c in new_coins])}")
+        
+        if reason == "hourly":
+            message = (
+                "⏱️ <b>1시간 자동 종목 갱신</b>\n\n"
+                f"유지: {len(kept_coins)}개\n"
+                f"추가: {len(added_coins)}개\n"
+                f"제외: {len(removed_coins)}개"
+            )
+            
+            if added_coins:
+                added_names = [c.replace('KRW-', '') for c in sorted(added_coins)]
+                message += f"\n\n➕ 추가: {', '.join(added_names)}"
+            
+            if removed_coins:
+                removed_names = [c.replace('KRW-', '') for c in sorted(removed_coins)]
+                message += f"\n➖ 제외: {', '.join(removed_names)}"
+            
+            self.telegram.send_message(message)
+            self.logger.info(
+                f"텔레그램: 1시간 자동 종목 갱신 알림 - 유지 {len(kept_coins)}, "
+                f"추가 {len(added_coins)}, 제외 {len(removed_coins)}"
+            )
     
     def _trading_loop(self):
         """거래 루프 (별도 스레드에서 실행)"""
@@ -1071,7 +1159,7 @@ class TradingBot:
                     elapsed_hours = (datetime.now() - self.last_coin_refresh).total_seconds() / 3600
                     
                     if elapsed_hours >= self.refresh_interval_hours:
-                        self._refresh_coin_list()
+                        self._refresh_coin_list(reason="hourly")
                 
                 # 거래 대상이 비어있으면 짧은 주기로 재조회
                 if not self.target_coins:
@@ -1129,6 +1217,10 @@ class TradingBot:
                                     f"  ⚠️  {ticker} 실제 잔고 존재 ({actual_balance:.8f}), 매수 취소"
                                 )
                                 continue
+                        
+                        # 손절 직후 동일 종목 재진입 방지
+                        if self.reentry_cooldown_after_stoploss_minutes > 0 and self._is_reentry_cooldown_active(ticker):
+                            continue
                         
                         # 매수 신호 확인
                         buy_signal, signals, current_price, signal_score = self.engine.check_buy_signal(ticker)
@@ -1275,6 +1367,14 @@ class TradingBot:
                                     
                                     self.stats.remove_position(ticker, sell_result['price'], profit_krw, reason)
                                     
+                                    # 손절이면 동일 종목 재진입 쿨다운 적용
+                                    if "손절" in str(reason):
+                                        self._set_reentry_cooldown(
+                                            ticker,
+                                            self.reentry_cooldown_after_stoploss_minutes,
+                                            reason
+                                        )
+                                    
                                     # 전량 매도 시에만 텔레그램 알림
                                     holding_time = (datetime.now() - position['timestamp']).total_seconds()
                                     success = self.telegram.notify_sell(
@@ -1338,6 +1438,8 @@ class TradingBot:
 def print_help():
     """도움말 출력"""
     print("\n" + "="*80)
+    print(f"ℹ️ 버전: {BOT_NAME} v{BOT_VERSION}")
+    print("="*80)
     print("📖 사용 가능한 명령어")
     print("="*80)
     print("  start   - 트레이딩 시작 (코인 선정 후 자동 매매 시작)")
@@ -1345,6 +1447,7 @@ def print_help():
     print("  status  - 현재 거래 상태 및 통계 표시")
     print("  daily   - 오늘의 거래 통계 표시")
     print("  refresh - 종목 목록 갱신 (포지션은 유지)")
+    print("  version - 버전 정보 표시")
     print("  help    - 도움말 표시")
     print("  exit    - 프로그램 종료")
     print("")
@@ -1356,7 +1459,7 @@ def main():
     """메인 함수"""
     
     print("="*80)
-    print("🤖 업비트 자동매매 봇 v1.0")
+    print(f"🤖 {BOT_DISPLAY_NAME} v{BOT_VERSION}")
     print("="*80)
     print("설정 파일을 로드합니다...")
     
@@ -1371,6 +1474,11 @@ def main():
     
     print("✅ 봇 초기화 완료")
     print_help()
+    
+    # 자동 시작
+    if bot.auto_start_on_launch:
+        print("🚀 auto_start_on_launch=true, 트레이딩을 자동 시작합니다...")
+        bot.start()
     
     # readline 설정 (명령어 히스토리)
     histfile = os.path.join(os.path.expanduser("~"), ".trading_bot_history")
@@ -1406,6 +1514,9 @@ def main():
             
             elif command == 'refresh':
                 bot.refresh_coins()
+            
+            elif command == 'version':
+                print(f"ℹ️ {BOT_NAME} v{BOT_VERSION}")
             
             elif command == 'help':
                 print_help()

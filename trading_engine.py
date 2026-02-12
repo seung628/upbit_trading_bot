@@ -39,6 +39,15 @@ class TradingEngine:
         self.atr_period = config['risk_management'].get('atr_period', 14)
         self.atr_sl_multiplier = config['risk_management'].get('atr_stop_loss_multiplier', 1.5)
         self.atr_tp_multiplier = config['risk_management'].get('atr_take_profit_multiplier', 2.5)
+        # ATR 기반 손절이 너무 타이트해지는 것을 방지 (예: minute1 ATR로 -0.3% 손절 과다 방지)
+        # 값은 퍼센트(예: -0.7)로 설정하며, ATR 기반 손절이 이 값보다 덜(=더 타이트)하면 이 값으로 완화합니다.
+        self.min_atr_stop_loss = None
+        try:
+            min_atr_sl_pct = config['risk_management'].get('min_atr_stop_loss_pct', None)
+            if min_atr_sl_pct is not None:
+                self.min_atr_stop_loss = float(min_atr_sl_pct) / 100
+        except Exception:
+            self.min_atr_stop_loss = None
         
         # 고정 % 손익
         self.stop_loss = config['risk_management']['stop_loss_pct'] / 100
@@ -371,7 +380,14 @@ class TradingEngine:
             
             # ATR 기반 손절/익절 계산 (ATR 사용 시)
             if self.use_atr and not pd.isna(current_atr) and current_atr > 0:
+                # 기본 ATR 손절(가격 기준)
                 atr_stop_loss = buy_price - (current_atr * self.atr_sl_multiplier)
+                
+                # ATR 손절 하한(퍼센트) 적용: 너무 타이트한 손절은 완화
+                if self.min_atr_stop_loss is not None and buy_price > 0:
+                    atr_sl_rate = -((current_atr * self.atr_sl_multiplier) / buy_price)  # 음수
+                    effective_sl_rate = min(atr_sl_rate, self.min_atr_stop_loss)  # 더 타이트하면(min_atr_stop_loss)로 완화
+                    atr_stop_loss = buy_price * (1 + effective_sl_rate)
                 atr_take_profit = buy_price + (current_atr * self.atr_tp_multiplier)
                 
                 # ATR 기반 손절 (가격 기준)
@@ -666,32 +682,137 @@ class TradingEngine:
                     result = self.upbit.sell_limit_order(ticker, ask_price, sell_amount)
                     
                     if result and 'uuid' in result:
+                        order_uuid = result['uuid']
                         # 체결 대기
                         time.sleep(self.limit_wait_seconds)
                         
                         # 체결 확인
-                        order_info = self.upbit.get_order(result['uuid'])
+                        order_info = self.upbit.get_order(order_uuid)
                         
-                        if order_info and order_info['state'] == 'done':
-                            # 체결 완료
-                            total_krw = sell_amount * ask_price
-                            fee = total_krw * self.FEE / 2  # 지정가는 수수료 절반
+                        if order_info:
+                            executed_volume = float(order_info.get('executed_volume', 0) or 0)
+                            paid_fee = float(order_info.get('paid_fee', 0) or 0)
                             
-                            self.logger.info(f"  ✅ 지정가 체결: {ask_price:,.0f}원")
+                            # 체결 금액(원화)을 최대한 정확히 계산 (trades > executed_funds > 가격*수량 폴백)
+                            gross_krw = 0.0
+                            trades = order_info.get('trades')
+                            if isinstance(trades, list) and trades:
+                                for t in trades:
+                                    try:
+                                        gross_krw += float(t.get('price', 0)) * float(t.get('volume', 0))
+                                    except Exception:
+                                        continue
                             
-                            remaining_balance = self.get_tradable_balance(ticker)
-                            return {
-                                'price': ask_price,
-                                'amount': sell_amount,
-                                'total_krw': total_krw * (1 - self.FEE / 2),
-                                'fee': fee,
-                                'remaining_amount': remaining_balance
-                            }
-                        
-                        else:
+                            if gross_krw <= 0:
+                                try:
+                                    gross_krw = float(order_info.get('executed_funds', 0) or 0)
+                                except Exception:
+                                    gross_krw = 0.0
+                            
+                            if gross_krw <= 0 and executed_volume > 0:
+                                gross_krw = executed_volume * ask_price
+                            
+                            limit_fee = paid_fee if paid_fee > 0 else gross_krw * (self.FEE / 2)
+                            limit_net = (gross_krw - paid_fee) if paid_fee > 0 else gross_krw * (1 - self.FEE / 2)
+                            limit_avg_price = (gross_krw / executed_volume) if executed_volume > 0 else ask_price
+                            
+                            # 완전 체결
+                            if order_info.get('state') == 'done':
+                                self.logger.info(f"  ✅ 지정가 체결: {limit_avg_price:,.0f}원")
+                                
+                                remaining_balance = self.get_tradable_balance(ticker)
+                                return {
+                                    'price': limit_avg_price,
+                                    'amount': executed_volume,
+                                    'total_krw': limit_net,
+                                    'fee': limit_fee,
+                                    'remaining_amount': remaining_balance
+                                }
+                            
+                            # 부분 체결
+                            if executed_volume > 0:
+                                self.logger.warning(
+                                    f"  ⚠️  부분체결: {executed_volume:.8f} / {sell_amount:.8f}"
+                                )
+                                
+                                # 남은 주문 취소
+                                self.upbit.cancel_order(order_uuid)
+                                time.sleep(0.3)
+                                
+                                remaining_balance = self.get_tradable_balance(ticker)
+                                remaining_price = self.get_current_price(ticker) or current_price
+                                remaining_value = remaining_balance * remaining_price if remaining_price else 0
+                                min_trade = self.config['trading']['min_trade_amount']
+                                
+                                # 남은 수량이 최소 주문금액 미만이면 부분체결만으로 종료
+                                if remaining_balance <= 0 or remaining_value < min_trade:
+                                    return {
+                                        'price': limit_avg_price,
+                                        'amount': executed_volume,
+                                        'total_krw': limit_net,
+                                        'fee': limit_fee,
+                                        'remaining_amount': remaining_balance
+                                    }
+                                
+                                self.logger.info(f"  ↪️  남은 {remaining_balance:.8f} 시장가 처리")
+                                market_result = self.upbit.sell_market_order(ticker, round(remaining_balance, 8))
+                                if market_result and 'uuid' in market_result:
+                                    time.sleep(0.5)
+                                    market_info = self.upbit.get_order(market_result['uuid'])
+                                    
+                                    if market_info:
+                                        market_volume = float(market_info.get('executed_volume', 0) or 0)
+                                        market_paid_fee = float(market_info.get('paid_fee', 0) or 0)
+                                        
+                                        market_gross = 0.0
+                                        trades = market_info.get('trades')
+                                        if isinstance(trades, list) and trades:
+                                            for t in trades:
+                                                try:
+                                                    market_gross += float(t.get('price', 0)) * float(t.get('volume', 0))
+                                                except Exception:
+                                                    continue
+                                        
+                                        if market_gross <= 0 and market_volume > 0:
+                                            market_avg = float(market_info.get('avg_sell_price', 0) or 0)
+                                            if market_avg == 0:
+                                                market_avg = remaining_price or current_price
+                                                self.logger.warning(
+                                                    f"  ⚠️  avg_sell_price 없음, current_price 사용: {market_avg:,.0f}원"
+                                                )
+                                            market_gross = market_volume * market_avg
+                                        
+                                        market_fee = market_paid_fee if market_paid_fee > 0 else market_gross * self.FEE
+                                        market_net = (market_gross - market_paid_fee) if market_paid_fee > 0 else market_gross * (1 - self.FEE)
+                                        
+                                        total_volume = executed_volume + market_volume
+                                        total_gross = gross_krw + market_gross
+                                        total_fee = limit_fee + market_fee
+                                        total_net = limit_net + market_net
+                                        avg_price = (total_gross / total_volume) if total_volume > 0 else current_price
+                                        remaining_balance = self.get_tradable_balance(ticker)
+                                        
+                                        return {
+                                            'price': avg_price,
+                                            'amount': total_volume,
+                                            'total_krw': total_net,
+                                            'fee': total_fee,
+                                            'remaining_amount': remaining_balance
+                                        }
+                                
+                                # 시장가 처리 실패 시 부분체결만 반환
+                                remaining_balance = self.get_tradable_balance(ticker)
+                                return {
+                                    'price': limit_avg_price,
+                                    'amount': executed_volume,
+                                    'total_krw': limit_net,
+                                    'fee': limit_fee,
+                                    'remaining_amount': remaining_balance
+                                }
+                            
                             # 미체결 - 주문 취소 후 시장가로 폴백
                             self.logger.debug(f"  ⚠️  지정가 미체결, 시장가로 전환")
-                            self.upbit.cancel_order(result['uuid'])
+                            self.upbit.cancel_order(order_uuid)
                             time.sleep(0.3)
             
             # 2단계: 시장가 주문 (폴백 또는 기본)

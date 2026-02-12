@@ -8,6 +8,8 @@ import threading
 import time
 import re
 
+from version import BOT_NAME, BOT_DISPLAY_NAME, BOT_VERSION
+
 
 class TelegramNotifier:
     def __init__(self, config):
@@ -21,6 +23,7 @@ class TelegramNotifier:
         self.is_listening = False
         self.command_handler = None
         self.silent_mode = False
+        self.poll_timeout_seconds = 3
         self.notify_buy_enabled = True
         self.notify_sell_enabled = True
         self.notify_error_enabled = True
@@ -72,6 +75,7 @@ class TelegramNotifier:
                 
                 # 명령어 처리
                 self.enable_commands = self.config.get('enable_commands', False)
+                self.poll_timeout_seconds = int(self.config.get('poll_timeout_seconds', 3))
                 
                 print("✅ 텔레그램 알림 활성화됨")
     
@@ -102,10 +106,10 @@ class TelegramNotifier:
             url = f"{self.base_url}/getUpdates"
             params = {
                 'offset': self.last_update_id + 1,
-                'timeout': 30
+                'timeout': self.poll_timeout_seconds
             }
             
-            response = requests.get(url, params=params, timeout=35)
+            response = requests.get(url, params=params, timeout=self.poll_timeout_seconds + 5)
             if response.status_code == 200:
                 data = response.json()
                 if data.get('ok'):
@@ -162,16 +166,32 @@ class TelegramNotifier:
                 print(f"명령어 수신 오류: {e}")
                 time.sleep(5)
     
-    def notify_start(self):
+    def notify_start(
+        self,
+        bot_name=BOT_NAME,
+        bot_version=BOT_VERSION,
+        display_name=BOT_DISPLAY_NAME,
+        selected_coins=None
+    ):
         """거래 시작 알림"""
         if not self.enabled:
             return
         
+        title = display_name or bot_name
+        coins = selected_coins or []
+        if coins:
+            selected_text = ", ".join([coin.replace("KRW-", "") for coin in coins])
+        else:
+            selected_text = "없음 (자동 재탐색 중)"
+
         message = f"""🚀 <b>거래 시작</b>
 
+봇: {title}
+버전: v{bot_version}
 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+초기 선정 종목: {selected_text}
 
-upbit_trading_bot이 자동 매매를 시작합니다.
+{bot_name}이 자동 매매를 시작합니다.
 """
         self.send_message(message)
     

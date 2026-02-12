@@ -12,7 +12,7 @@
 /newbot
 
 Bot 이름 입력:
-QuantPilot Trading Bot
+upbit_trading_bot
 
 Bot 사용자명 입력:
 quantpilot_bot
@@ -262,7 +262,7 @@ logs/
 ```
 [텔레그램 채팅창]
 
-QuantPilot Bot
+upbit_trading_bot
 ━━━━━━━━━━━━━━━━
 
 🚀 거래 시작

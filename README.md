@@ -1,4 +1,4 @@
-# 🤖 QuantPilot - 업비트 자동매매 봇
+# 🤖 upbit_trading_bot - 업비트 자동매매 봇
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -196,6 +196,7 @@ python main.py
 
 ---
 
+
 ## ⚙️ 설정
 
 ### 기본 설정 (권장)
@@ -329,7 +330,7 @@ python main.py
 ```
 1. @BotFather 검색
 2. /newbot 입력
-3. 봇 이름: QuantPilot Trading Bot
+3. 봇 이름: upbit_trading_bot
 4. 사용자명: quantpilot_bot
 5. 토큰 받기
 ```
@@ -633,7 +634,7 @@ MIT License
 
 **Happy Trading! 🚀**
 
-Made with ❤️ by QuantPilot Team
+Made with ❤️ by upbit_trading_bot Team
 
 Version 1.0.3 - Production Ready
 
@@ -951,7 +952,7 @@ python main.py
 ```
 1. @BotFather 검색
 2. /newbot 입력
-3. 봇 이름: QuantPilot Trading Bot
+3. 봇 이름: upbit_trading_bot
 4. 사용자명: quantpilot_bot
 5. 토큰 받기
 ```
@@ -1203,4 +1204,4 @@ MIT License
 
 **Happy Trading! 🚀**
 
-Made with ❤️ by QuantPilot Team
+Made with ❤️ by upbit_trading_bot Team
