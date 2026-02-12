@@ -601,7 +601,8 @@ class TradingBot:
 📈 승률: {len(wins)/len(today_trades)*100:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
-💸 예상 수수료(왕복): {est_total_fee:,.0f}원
+💸 예상 수수료(기간): {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f} + 매도 {est_sell_fee:,.0f})
+💸 누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원
 💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 """
         
@@ -704,7 +705,8 @@ class TradingBot:
 📈 승률: {win_rate:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
-💸 예상 수수료(왕복): {est_total_fee:,.0f}원
+💸 예상 수수료(기간): {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f} + 매도 {est_sell_fee:,.0f})
+💸 누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원
 💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 
 📅 <b>일자별 손익</b>"""
@@ -1040,6 +1042,7 @@ class TradingBot:
         print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
         print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
         print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
+        print(f"  누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원")
         
         print(f"\n🏆 최고 거래")
         print(f"  코인: {best_trade['coin'].replace('KRW-', '')}")
@@ -1156,6 +1159,7 @@ class TradingBot:
         print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
         print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
         print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
+        print(f"  누적 수수료(세션): {self.stats.get_total_fees_krw():,.0f}원")
 
         print(f"\n📅 일자별 손익")
         for d in sorted(daily_profit.keys()):

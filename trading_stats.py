@@ -72,6 +72,11 @@ class TradingStats:
         with self.lock:
             self.total_fees += fee
         return fee
+
+    def get_total_fees_krw(self):
+        """누적 수수료(KRW)를 반환 (세션 기준, 스레드 안전)."""
+        with self.lock:
+            return float(self.total_fees or 0)
     
     def start(self, initial_balance):
         """거래 시작"""
