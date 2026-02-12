@@ -465,6 +465,10 @@ class TradingBot:
             elif cmd == '/daily' or cmd == '/일일':
                 self._telegram_daily()
             
+            # /weekly - 주간 통계(최근 7일)
+            elif cmd == '/weekly' or cmd == '/주간':
+                self._telegram_weekly()
+            
             # /positions - 포지션 현황
             elif cmd == '/positions' or cmd == '/포지션':
                 self._telegram_positions()
@@ -578,6 +582,105 @@ class TradingBot:
         if losses:
             worst = min(losses, key=lambda x: x['profit_krw'])
             message += f"\n📉 최악: {worst['coin'].replace('KRW-', '')} {worst['profit_krw']:+,.0f}원"
+        
+        self.telegram.send_message(message)
+
+    def _telegram_weekly(self):
+        """텔레그램: 주간 리포트 (최근 7일)"""
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=6)
+        
+        # 파일 + 메모리 통합 (중복 제거: timestamp 기준)
+        all_trades_dict = {}
+        
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            # load_daily_trades는 datetime 또는 YYYYMMDD 문자열을 받음
+            file_trades = self.stats.load_daily_trades(datetime.combine(d, datetime.min.time()))
+            for t in file_trades:
+                all_trades_dict[t['timestamp'].isoformat()] = t
+        
+        memory_trades = [
+            t for t in self.stats.trades
+            if start_date <= t['timestamp'].date() <= end_date
+        ]
+        for t in memory_trades:
+            all_trades_dict[t['timestamp'].isoformat()] = t
+        
+        week_trades = list(all_trades_dict.values())
+        
+        if not week_trades:
+            self.telegram.send_message(
+                f"📆 최근 7일 거래 내역이 없습니다.\n\n"
+                f"기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}"
+            )
+            return
+        
+        wins = [t for t in week_trades if t['profit_krw'] > 0]
+        losses = [t for t in week_trades if t['profit_krw'] <= 0]
+        total_profit = sum(t['profit_krw'] for t in week_trades)
+        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
+        
+        best = max(week_trades, key=lambda x: x['profit_krw'])
+        worst = min(week_trades, key=lambda x: x['profit_krw'])
+        
+        # 일자별 손익/횟수
+        daily_profit = {}
+        daily_count = {}
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            daily_profit[d] = 0
+            daily_count[d] = 0
+        
+        # 종목별 손익
+        coin_profit = {}
+        
+        for t in week_trades:
+            d = t['timestamp'].date()
+            daily_profit[d] = daily_profit.get(d, 0) + t['profit_krw']
+            daily_count[d] = daily_count.get(d, 0) + 1
+            
+            coin = t['coin'].replace('KRW-', '')
+            coin_profit[coin] = coin_profit.get(coin, 0) + t['profit_krw']
+        
+        top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
+        
+        best_coin = best['coin'].replace('KRW-', '')
+        worst_coin = worst['coin'].replace('KRW-', '')
+        
+        message = f"""📆 <b>주간 리포트</b>
+
+기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}
+
+📊 거래: {len(week_trades)}회
+✅ 승: {len(wins)}회
+❌ 패: {len(losses)}회
+📈 승률: {win_rate:.1f}%
+
+💰 총 손익: {total_profit:+,.0f}원
+
+📅 <b>일자별 손익</b>"""
+        
+        for d in sorted(daily_profit.keys()):
+            pnl = daily_profit[d]
+            cnt = daily_count.get(d, 0)
+            message += f"\n{d.strftime('%m-%d')}: {pnl:+,.0f}원 ({cnt}회)"
+        
+        message += (
+            f"\n\n🏆 최고: {best_coin} {best['profit_krw']:+,.0f}원"
+            f"\n📉 최악: {worst_coin} {worst['profit_krw']:+,.0f}원"
+        )
+        
+        if top_winners:
+            message += "\n\n📈 <b>종목 상위</b>"
+            for coin, pnl in top_winners:
+                message += f"\n{coin}: {pnl:+,.0f}원"
+        
+        if top_losers:
+            message += "\n\n📉 <b>종목 하위</b>"
+            for coin, pnl in top_losers:
+                message += f"\n{coin}: {pnl:+,.0f}원"
         
         self.telegram.send_message(message)
     
@@ -704,6 +807,7 @@ class TradingBot:
 📊 <b>정보 조회</b>
 /status - 현재 상태
 /daily - 일일 통계
+/weekly - 주간 리포트(최근 7일)
 /positions - 보유 포지션
 /balance - 잔고 확인
 
@@ -885,6 +989,102 @@ class TradingBot:
             print(f"  {emoji} {coin}: {stats['trades']}회 | {stats['profit']:+,.0f}원")
         
         print("="*80 + "\n")
+
+    def weekly_stats(self):
+        """주간 통계 표시 (최근 7일, 파일 기록 포함)"""
+
+        print("\n" + "="*80)
+        print("📆 주간 거래 통계 (최근 7일)")
+        print("="*80)
+
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=6)
+
+        # 파일 + 메모리 통합 (중복 제거: timestamp 기준)
+        all_trades_dict = {}
+
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            file_trades = self.stats.load_daily_trades(datetime.combine(d, datetime.min.time()))
+            for t in file_trades:
+                all_trades_dict[t['timestamp'].isoformat()] = t
+
+        memory_trades = [
+            t for t in self.stats.trades
+            if start_date <= t['timestamp'].date() <= end_date
+        ]
+        for t in memory_trades:
+            all_trades_dict[t['timestamp'].isoformat()] = t
+
+        week_trades = list(all_trades_dict.values())
+
+        if not week_trades:
+            print("\n⚠️  최근 7일 거래 내역이 없습니다.")
+            print(f"  기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
+            print("="*80 + "\n")
+            return
+
+        wins = [t for t in week_trades if t['profit_krw'] > 0]
+        losses = [t for t in week_trades if t['profit_krw'] <= 0]
+        total_profit = sum(t['profit_krw'] for t in week_trades)
+        win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
+
+        best = max(week_trades, key=lambda x: x['profit_krw'])
+        worst = min(week_trades, key=lambda x: x['profit_krw'])
+
+        # 일자별 손익/횟수
+        daily_profit = {}
+        daily_count = {}
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            daily_profit[d] = 0
+            daily_count[d] = 0
+
+        # 종목별 손익
+        coin_profit = {}
+
+        for t in week_trades:
+            d = t['timestamp'].date()
+            daily_profit[d] = daily_profit.get(d, 0) + t['profit_krw']
+            daily_count[d] = daily_count.get(d, 0) + 1
+
+            coin = t['coin'].replace('KRW-', '')
+            coin_profit[coin] = coin_profit.get(coin, 0) + t['profit_krw']
+
+        top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
+
+        best_coin = best['coin'].replace('KRW-', '')
+        worst_coin = worst['coin'].replace('KRW-', '')
+
+        print(f"\n📅 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
+        print(f"📊 거래: {len(week_trades)}회")
+        print(f"✅ 승: {len(wins)}회")
+        print(f"❌ 패: {len(losses)}회")
+        print(f"📈 승률: {win_rate:.1f}%")
+
+        print(f"\n💰 총 손익: {total_profit:+,.0f}원")
+
+        print(f"\n📅 일자별 손익")
+        for d in sorted(daily_profit.keys()):
+            pnl = daily_profit[d]
+            cnt = daily_count.get(d, 0)
+            print(f"  {d.strftime('%Y-%m-%d')}: {pnl:+,.0f}원 ({cnt}회)")
+
+        print(f"\n🏆 최고 거래: {best_coin} {best['profit_krw']:+,.0f}원")
+        print(f"📉 최악 거래: {worst_coin} {worst['profit_krw']:+,.0f}원")
+
+        if top_winners:
+            print(f"\n📈 종목 상위")
+            for coin, pnl in top_winners:
+                print(f"  {coin}: {pnl:+,.0f}원")
+
+        if top_losers:
+            print(f"\n📉 종목 하위")
+            for coin, pnl in top_losers:
+                print(f"  {coin}: {pnl:+,.0f}원")
+
+        print("="*80 + "\n")
     
     def refresh_coins(self):
         """종목 목록 수동 갱신 (포지션 유지)"""
@@ -1030,9 +1230,17 @@ class TradingBot:
         return investment
     
     def _refresh_coin_list(self, reason="auto"):
-        """코인 목록 갱신 (기존 포지션은 유지). reason='hourly'면 텔레그램 알림 전송"""
+        """코인 목록 갱신 (기존 포지션은 유지).
+
+        - reason='hourly'면 텔레그램 알림 전송
+        - 갱신 실패 시에도 과도한 반복 시도를 방지하기 위해 시도 시각(last_coin_refresh)을 갱신합니다.
+        """
         
         self.logger.info("🔄 코인 목록 갱신 시작")
+        
+        # 실패 시에도 다음 주기까지 대기하도록 \"시도\" 시각을 먼저 갱신
+        refresh_ts = datetime.now()
+        self.last_coin_refresh = refresh_ts
         
         # 새로운 코인 목록 가져오기
         new_coins = self.coin_selector.get_top_coins(self.max_coins)
@@ -1059,7 +1267,7 @@ class TradingBot:
         
         # 새로운 목록으로 교체
         self.target_coins = new_coins
-        self.last_coin_refresh = datetime.now()
+        self.last_coin_refresh = refresh_ts
         
         self.logger.info(f"✅ 코인 목록 갱신 완료: {', '.join([c.replace('KRW-', '') for c in new_coins])}")
         
@@ -1446,6 +1654,7 @@ def print_help():
     print("  stop    - 트레이딩 정지 (모든 포지션 청산)")
     print("  status  - 현재 거래 상태 및 통계 표시")
     print("  daily   - 오늘의 거래 통계 표시")
+    print("  weekly  - 최근 7일 거래 통계 표시")
     print("  refresh - 종목 목록 갱신 (포지션은 유지)")
     print("  version - 버전 정보 표시")
     print("  help    - 도움말 표시")
@@ -1511,6 +1720,9 @@ def main():
             
             elif command == 'daily':
                 bot.daily_stats()
+
+            elif command == 'weekly':
+                bot.weekly_stats()
             
             elif command == 'refresh':
                 bot.refresh_coins()
