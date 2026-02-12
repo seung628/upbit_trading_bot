@@ -412,6 +412,9 @@ class TradingBot:
                 sell_result = self.engine.execute_sell(coin, position, 1.0)
                 
                 if sell_result:
+                    # 수수료 누적(가능하면 실제, 없으면 추정)
+                    self.stats.add_fee(sell_result.get('fee', 0))
+
                     remaining_amount = sell_result.get('remaining_amount')
                     if remaining_amount is None:
                         remaining_amount = self.engine.get_tradable_balance(coin)
@@ -513,6 +516,14 @@ class TradingBot:
         # 사용 가능 금액 계산
         invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
         available = min(self.max_total_investment - invested, status['current_balance'])
+
+        # 수수료/예상 청산 수수료(보유 포지션 기준)
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_exit_fee = 0.0
+        for coin, pos in self.stats.positions.items():
+            price = self.engine.get_current_price(coin) or pos.get('buy_price')
+            if price:
+                est_exit_fee += float(price) * float(pos.get('amount', 0) or 0) * fee_rate
         
         state = "▶️ 실행 중" if self.is_running else "⏸️ 정지"
         if self.is_trading_paused:
@@ -533,6 +544,10 @@ class TradingBot:
 📈 <b>수익</b>
 총 평가액: {status['total_value']:,.0f}원
 총 수익률: {status['total_return']:+.2f}%
+
+💸 <b>수수료(추정)</b>
+누적(세션): {status.get('total_fees_krw', 0):,.0f}원
+예상 청산: {est_exit_fee:,.0f}원
 
 📊 <b>거래 통계</b>
 총 거래: {status['total_trades']}회
@@ -563,6 +578,22 @@ class TradingBot:
         losses = [t for t in today_trades if t['profit_krw'] <= 0]
         total_profit = sum(t['profit_krw'] for t in today_trades)
         
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_buy_fee = 0.0
+        est_sell_fee = 0.0
+        for t in today_trades:
+            try:
+                buy_price = float(t.get('buy_price', 0) or 0)
+                sell_price = float(t.get('sell_price', 0) or 0)
+                amount = float(t.get('amount', 0) or 0)
+                est_buy_fee += buy_price * amount * fee_rate
+                est_sell_fee += sell_price * amount * fee_rate
+            except Exception:
+                continue
+        est_total_fee = est_buy_fee + est_sell_fee
+        # profit_krw는 매도 수수료(net) 기준이므로, 매수 수수료만 추가 반영한 손익(추정)
+        est_profit_after_fees = total_profit - est_buy_fee
+        
         message = f"""📅 <b>일일 통계</b>
 
 날짜: {today.strftime('%Y-%m-%d')}
@@ -573,6 +604,8 @@ class TradingBot:
 📈 승률: {len(wins)/len(today_trades)*100:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
+💸 예상 수수료(왕복): {est_total_fee:,.0f}원
+💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 """
         
         if wins:
@@ -620,6 +653,21 @@ class TradingBot:
         losses = [t for t in week_trades if t['profit_krw'] <= 0]
         total_profit = sum(t['profit_krw'] for t in week_trades)
         win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
+
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_buy_fee = 0.0
+        est_sell_fee = 0.0
+        for t in week_trades:
+            try:
+                buy_price = float(t.get('buy_price', 0) or 0)
+                sell_price = float(t.get('sell_price', 0) or 0)
+                amount = float(t.get('amount', 0) or 0)
+                est_buy_fee += buy_price * amount * fee_rate
+                est_sell_fee += sell_price * amount * fee_rate
+            except Exception:
+                continue
+        est_total_fee = est_buy_fee + est_sell_fee
+        est_profit_after_fees = total_profit - est_buy_fee
         
         best = max(week_trades, key=lambda x: x['profit_krw'])
         worst = min(week_trades, key=lambda x: x['profit_krw'])
@@ -659,6 +707,8 @@ class TradingBot:
 📈 승률: {win_rate:.1f}%
 
 💰 총 손익: {total_profit:+,.0f}원
+💸 예상 수수료(왕복): {est_total_fee:,.0f}원
+💰 손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원
 
 📅 <b>일자별 손익</b>"""
         
@@ -863,6 +913,18 @@ class TradingBot:
         print(f"  총 평가액: {status['total_value']:,.0f}원")
         print(f"  총 수익률: {status['total_return']:+.2f}%")
         print(f"  총 손익: {status['total_profit_krw']:+,.0f}원")
+
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_exit_fee = 0.0
+        for coin, pos in self.stats.positions.items():
+            price = self.engine.get_current_price(coin) or pos.get('buy_price')
+            if price:
+                est_exit_fee += float(price) * float(pos.get('amount', 0) or 0) * fee_rate
+
+        print(f"\n💸 수수료(추정) (수수료율 {fee_rate*100:.3f}%)")
+        print(f"  누적 수수료(세션): {status.get('total_fees_krw', 0):,.0f}원")
+        print(f"  예상 청산 수수료: {est_exit_fee:,.0f}원")
+        print(f"  평가액(청산수수료 차감): {status['total_value'] - est_exit_fee:,.0f}원")
         
         print(f"\n📈 거래 통계")
         print(f"  총 거래 횟수: {status['total_trades']}회")
@@ -944,6 +1006,21 @@ class TradingBot:
         
         total_profit = sum(t['profit_krw'] for t in today_trades)
         avg_profit = total_profit / total_trades if total_trades > 0 else 0
+
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_buy_fee = 0.0
+        est_sell_fee = 0.0
+        for t in today_trades:
+            try:
+                buy_price = float(t.get('buy_price', 0) or 0)
+                sell_price = float(t.get('sell_price', 0) or 0)
+                amount = float(t.get('amount', 0) or 0)
+                est_buy_fee += buy_price * amount * fee_rate
+                est_sell_fee += sell_price * amount * fee_rate
+            except Exception:
+                continue
+        est_total_fee = est_buy_fee + est_sell_fee
+        est_profit_after_fees = total_profit - est_buy_fee
         
         best_trade = max(today_trades, key=lambda x: x['profit_rate'])
         worst_trade = min(today_trades, key=lambda x: x['profit_rate'])
@@ -966,6 +1043,9 @@ class TradingBot:
         print(f"\n💰 수익 현황")
         print(f"  총 손익: {total_profit:+,.0f}원")
         print(f"  평균 손익: {avg_profit:+,.0f}원")
+        print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
+        print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
+        print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
         
         print(f"\n🏆 최고 거래")
         print(f"  코인: {best_trade['coin'].replace('KRW-', '')}")
@@ -1029,6 +1109,21 @@ class TradingBot:
         total_profit = sum(t['profit_krw'] for t in week_trades)
         win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
 
+        fee_rate = getattr(self.engine, "FEE", 0.0005)
+        est_buy_fee = 0.0
+        est_sell_fee = 0.0
+        for t in week_trades:
+            try:
+                buy_price = float(t.get('buy_price', 0) or 0)
+                sell_price = float(t.get('sell_price', 0) or 0)
+                amount = float(t.get('amount', 0) or 0)
+                est_buy_fee += buy_price * amount * fee_rate
+                est_sell_fee += sell_price * amount * fee_rate
+            except Exception:
+                continue
+        est_total_fee = est_buy_fee + est_sell_fee
+        est_profit_after_fees = total_profit - est_buy_fee
+
         best = max(week_trades, key=lambda x: x['profit_krw'])
         worst = min(week_trades, key=lambda x: x['profit_krw'])
 
@@ -1064,6 +1159,9 @@ class TradingBot:
         print(f"📈 승률: {win_rate:.1f}%")
 
         print(f"\n💰 총 손익: {total_profit:+,.0f}원")
+        print(f"\n💸 예상 수수료(왕복) (수수료율 {fee_rate*100:.3f}%)")
+        print(f"  합계: {est_total_fee:,.0f}원 (매수 {est_buy_fee:,.0f}원 + 매도 {est_sell_fee:,.0f}원)")
+        print(f"  손익(매수수수료 반영): {est_profit_after_fees:+,.0f}원")
 
         print(f"\n📅 일자별 손익")
         for d in sorted(daily_profit.keys()):
@@ -1501,6 +1599,9 @@ class TradingBot:
                                                 signals,
                                                 new_balance
                                             )
+                                            
+                                            # 수수료 누적(가능하면 실제, 없으면 추정)
+                                            self.stats.add_fee(buy_result.get('fee', 0))
                                         else:
                                             # 매수 실패
                                             self.logger.warning(f"⚠️  {ticker} 매수 실패")
@@ -1545,6 +1646,9 @@ class TradingBot:
                                     reason,
                                     new_balance
                                 )
+
+                                # 수수료 누적(가능하면 실제, 없으면 추정)
+                                self.stats.add_fee(sell_result.get('fee', 0))
                                 
                                 # 통계 업데이트
                                 if sell_ratio >= 1.0:  # 전량 매도
@@ -1625,6 +1729,7 @@ class TradingBot:
                                         final_sell = self.engine.execute_sell(ticker, position, 1.0)
                                         
                                         if final_sell:
+                                            self.stats.add_fee(final_sell.get('fee', 0))
                                             final_profit = final_sell['total_krw'] - (position['buy_price'] * position['amount'])
                                             self.stats.remove_position(ticker, final_sell['price'], final_profit, "소액청산")
                                             

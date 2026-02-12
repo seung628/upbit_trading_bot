@@ -55,6 +55,23 @@ class TradingStats:
         # 일일 통계
         self.daily_start_balance = 0
         self.daily_trades_count = 0
+
+    def add_fee(self, fee_krw):
+        """수수료 누적(스레드 안전).
+
+        fee_krw는 KRW 기준 실수(float)로 가정합니다.
+        """
+        try:
+            fee = float(fee_krw or 0)
+        except Exception:
+            fee = 0.0
+
+        if fee <= 0:
+            return 0.0
+
+        with self.lock:
+            self.total_fees += fee
+        return fee
     
     def start(self, initial_balance):
         """거래 시작"""
@@ -199,6 +216,7 @@ class TradingStats:
                 'total_value': total_value,
                 'total_return': total_return,
                 'total_profit_krw': self.total_profit_krw,
+                'total_fees_krw': self.total_fees,
                 'total_trades': self.total_trades,
                 'wins': self.wins,
                 'losses': self.losses,
