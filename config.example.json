@@ -9,6 +9,8 @@
     "_comment": "거래 기본 설정",
     "max_coins": 3,
     "buy_amount_krw": 100000,
+    "_comment_fee": "수수료율(%) - 기본 0.05 (예: 0.05 => 0.05%)",
+    "fee_pct": 0.05,
     "reentry_cooldown_after_stoploss_minutes": 10,
     "untracked_balance": {
       "_comment": "미기록 잔고 처리: ignore | attach | cleanup_small",

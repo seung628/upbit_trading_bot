@@ -18,7 +18,14 @@ class TradingEngine:
         self.stats = stats
         
         self.upbit = None
-        self.FEE = 0.0005  # 업비트 수수료 0.05%
+        # Fee rate (fraction). Default 0.05% = 0.0005
+        self.FEE = 0.0005
+        try:
+            fee_pct = config.get('trading', {}).get('fee_pct', None)
+            if fee_pct is not None:
+                self.FEE = float(fee_pct) / 100
+        except Exception:
+            self.FEE = 0.0005
         
         # 설정값 로드
         self.bb_period = config['indicators']['bb_period']
