@@ -276,9 +276,10 @@ class TradingBot:
             print(f"  ✅ 동적 투자:")
             print(f"     기본 금액: {self.config['trading']['buy_amount_krw']:,}원")
             print(f"     최대 한도: {self.config['trading']['max_total_investment']:,}원")
-            print(f"     점수 11점+: 기본 × 1.5배")
-            print(f"     점수 9-10점: 기본 × 1.3배")
-            print(f"     점수 7-8점: 기본 × 1.0배")
+            print(f"     운용: 한도 내 슬롯 기반 배분 + 점수 가중")
+            print(f"     점수 11점+: 강한 가중(우선 배분)")
+            print(f"     점수 9-10점: 중간 가중")
+            print(f"     점수 7-8점: 기본 배분")
         else:
             print(f"  고정 금액: {self.config['trading']['buy_amount_krw']:,}원")
         
@@ -582,7 +583,8 @@ class TradingBot:
         
         # 사용 가능 금액 계산
         invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
-        available = min(self.max_total_investment - invested, status['current_balance'])
+        cap_remaining = max(0.0, self.max_total_investment - invested)
+        available = max(0.0, min(cap_remaining, status['current_balance']))
 
         # 수수료/예상 청산 수수료(보유 포지션 기준)
         fee_rate = getattr(self.engine, "FEE", 0.0005)
@@ -1030,9 +1032,12 @@ class TradingBot:
         
         # 사용 가능 금액 계산
         invested_amount = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
-        available_investment = min(
-            self.max_total_investment - invested_amount,
-            status['current_balance']
+        available_investment = max(
+            0.0,
+            min(
+                self.max_total_investment - invested_amount,
+                status['current_balance']
+            )
         )
         
         print(f"  투자 중: {invested_amount:,.0f}원")
@@ -1490,45 +1495,78 @@ class TradingBot:
         
         return False
     
-    def _calculate_dynamic_investment(self, signal_score):
-        """신호 강도에 따른 동적 투자 금액 계산"""
-        
-        if not self.dynamic_allocation:
-            return self.buy_amount_krw
-        
-        # 현재 투자 중인 금액 계산
+    def _calculate_dynamic_investment(self, signal_score, available_krw=None):
+        """투자 금액 계산 (총 투자 한도 고정 + 점수 기반 효율 배분)."""
+
+        min_trade = float(self.config['trading']['min_trade_amount'])
+
+        # 현재 투자 중인 금액(원가 기준)
         current_investment = sum(
-            pos['buy_price'] * pos['amount'] 
+            pos['buy_price'] * pos['amount']
             for pos in self.stats.positions.values()
         )
-        
-        # 남은 투자 가능 금액
-        available = self.max_total_investment - current_investment
-        
-        if available < self.config['trading']['min_trade_amount']:
-            return 0
-        
-        # 신호 점수에 따른 투자 비율
-        # 점수 7-8: 기본 금액
-        # 점수 9-10: 1.3배
-        # 점수 11+: 1.5배
-        
-        base_amount = self.buy_amount_krw
-        
-        if signal_score >= 11:
-            multiplier = 1.5
-        elif signal_score >= 9:
-            multiplier = 1.3
+
+        cap_remaining = max(0.0, float(self.max_total_investment) - float(current_investment))
+        if cap_remaining < min_trade:
+            return 0.0
+
+        if available_krw is None:
+            try:
+                available_krw = float(self.engine.get_balance("KRW") or 0)
+            except Exception:
+                available_krw = 0.0
         else:
-            multiplier = 1.0
-        
-        investment = min(base_amount * multiplier, available)
-        
-        # 최소 금액 체크
-        if investment < self.config['trading']['min_trade_amount']:
-            return 0
-        
-        return investment
+            try:
+                available_krw = float(available_krw or 0)
+            except Exception:
+                available_krw = 0.0
+
+        # 실제 주문 가능 예산: 현금 잔고와 투자 한도의 교집합
+        tradable_budget = max(0.0, min(cap_remaining, available_krw))
+        if tradable_budget < min_trade:
+            return 0.0
+
+        # 동적 배분 비활성화 시에도 한도는 반드시 준수
+        if not self.dynamic_allocation:
+            fixed_amount = min(float(self.buy_amount_krw), tradable_budget)
+            return float(int(fixed_amount)) if fixed_amount >= min_trade else 0.0
+
+        # 슬롯 기반 기본 배분: 남은 슬롯 수로 예산을 나눠 한도 활용률을 높임
+        try:
+            max_slots = max(1, int(self.max_coins))
+        except Exception:
+            max_slots = 1
+        active_positions = max(0, len(self.stats.positions))
+        slots_left = max(1, max_slots - active_positions)
+        slot_budget = tradable_budget / slots_left
+
+        # 기존 점수 정책(기본금액 배수) + 슬롯 가중 배분을 함께 사용
+        score = int(signal_score or 0)
+        if score >= 11:
+            legacy_multiplier = 1.5
+            slot_boost = 1.20
+        elif score >= 9:
+            legacy_multiplier = 1.3
+            slot_boost = 1.10
+        else:
+            legacy_multiplier = 1.0
+            slot_boost = 1.00
+
+        legacy_target = min(float(self.buy_amount_krw) * legacy_multiplier, tradable_budget)
+        slot_target = slot_budget * slot_boost
+        target = max(legacy_target, slot_target)
+
+        # 남은 슬롯을 위해 최소 주문 가능 금액은 보존
+        reserve_for_others = min_trade * max(0, slots_left - 1)
+        max_this_order = max(0.0, tradable_budget - reserve_for_others)
+        investment = min(target, max_this_order, tradable_budget)
+
+        if investment < min_trade:
+            if slots_left == 1 and tradable_budget >= min_trade:
+                return float(int(tradable_budget))
+            return 0.0
+
+        return float(int(investment))
 
     def _estimate_total_value(self, cash_balance):
         """총자산(현금+포지션 평가액) 추정.
@@ -1856,13 +1894,18 @@ class TradingBot:
                             except Exception:
                                 mid_price = None
                             
-                            # 동적 투자 금액 계산
-                            invest_amount = self._calculate_dynamic_investment(signal_score)
+                            # 현재 잔고 기준으로 투자 금액 계산(한도/잔고 동시 반영)
+                            raw_available_krw = self.engine.get_balance("KRW")
+                            try:
+                                available_krw = float(raw_available_krw or 0)
+                            except Exception:
+                                available_krw = 0.0
+                            invest_amount = self._calculate_dynamic_investment(
+                                signal_score,
+                                available_krw=available_krw
+                            )
                             
                             if invest_amount >= self.config['trading']['min_trade_amount']:
-                                # 잔고 확인
-                                available_krw = self.engine.get_balance("KRW")
-                                
                                 if available_krw >= invest_amount:
                                     # 매수 진행 표시 (실제 매수 직전)
                                     with self.buy_lock:
