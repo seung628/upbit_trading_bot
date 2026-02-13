@@ -234,44 +234,42 @@ class TradingBot:
         print("📋 현재 매수 조건")
         print("="*80)
         
-        print("\n🎯 신호 점수제")
-        if self.config['indicators'].get('use_signal_scoring', False):
-            print(f"  ✅ 사용 중: 최소 {self.config['indicators']['min_signal_score']}점 필요")
-            print(f"\n  📊 신호별 점수:")
-            print(f"     거래량 폭증 (2배+)      : 3점")
-            print(f"     MACD 골든크로스          : 3점")
-            print(f"     거래량 급증 (1.8배)     : 2점")
-            print(f"     BB 하단 반등             : 2점")
-            print(f"     가격 > MA20              : 2점")
-            print(f"     RSI 양호 (50-60)         : 2점")
-            print(f"     BB 하위 25%              : 2점")
-            print(f"     RSI 강세 (60-70)         : 1점")
-            print(f"     MA5 상승                 : 1점")
+        strategy_cfg = self.config.get('strategy', {})
+        mode = strategy_cfg.get('mode', 'trend_breakout')
+        entry_interval = strategy_cfg.get('entry_interval', 'minute1')
+        htf_interval = strategy_cfg.get('htf_interval', 'minute15')
+        breakout_lookback = strategy_cfg.get('entry_breakout_lookback', 20)
+        breakout_buffer = strategy_cfg.get('entry_breakout_buffer_pct', 0.05)
+        vol_min = strategy_cfg.get('entry_volume_ratio_min', 1.6)
+        rsi_min = strategy_cfg.get('entry_rsi_min', 52)
+        rsi_max = strategy_cfg.get('entry_rsi_max', 72)
+        entry_min_score = strategy_cfg.get('entry_min_score', 8)
+        entry_ma_fast = strategy_cfg.get('entry_ma_fast', 20)
+        entry_ma_slow = strategy_cfg.get('entry_ma_slow', 60)
+        htf_ma_fast = strategy_cfg.get('htf_ma_fast', 20)
+        htf_ma_slow = strategy_cfg.get('htf_ma_slow', 50)
 
-            print(f"\n  🔒 RSI 진입 필터:")
-            print(f"     RSI 50~70 구간에서만 매수 검토 (과매도 캐치 최소화)")
+        print("\n🎯 전략 모드")
+        print(f"  {mode} (비용 민감 추세 돌파)")
 
-            # 매수 품질 필터(과매매/수수료 드래그 완화)
-            require_price_above_ma20 = self.config.get('indicators', {}).get('require_price_above_ma20', True)
-            require_price_above_ma20 = True if require_price_above_ma20 is None else bool(require_price_above_ma20)
-            require_strong_trigger = self.config.get('indicators', {}).get('require_strong_trigger', True)
-            require_strong_trigger = True if require_strong_trigger is None else bool(require_strong_trigger)
-            strong_vol = self.config.get('indicators', {}).get('strong_trigger_min_volume_ratio', 1.8)
+        print("\n📌 매수 핵심 조건")
+        print(f"  1) {entry_interval} 추세: 가격 > EMA{entry_ma_fast} > EMA{entry_ma_slow}")
+        print(f"  2) {htf_interval} 추세: 가격 > EMA{htf_ma_fast} > EMA{htf_ma_slow}")
+        print(f"  3) 최근 {breakout_lookback}봉 고점 돌파 (+{breakout_buffer}%)")
+        print(f"  4) 거래량 비율: {vol_min}배 이상")
+        print(f"  5) RSI 범위: {rsi_min} <= RSI < {rsi_max}")
+        print(f"  6) 진입 점수: {entry_min_score}점 이상")
 
-            print(f"\n  🎛️ 매수 품질 필터:")
-            print(f"     가격 > MA20 필수: {'ON' if require_price_above_ma20 else 'OFF'}")
-            print(f"     강한 트리거 필수(거래량/MACD): {'ON' if require_strong_trigger else 'OFF'}")
-            if require_strong_trigger:
-                print(f"       - 거래량 트리거 기준: {strong_vol}배 이상 또는 MACD 골든크로스")
-        else:
-            print(f"  ❌ 미사용: 신호 개수 기준 ({self.config['indicators']['min_signals_required']}개 이상)")
-        
-        print("\n📈 추세 확인")
-        if self.config['indicators'].get('check_trend', False):
-            print(f"  ✅ 사용 중: MA20 기울기 {self.config['indicators']['min_trend_strength']*100}% 이상")
-            print(f"     → 횡보장 거래 금지")
-        else:
-            print(f"  ❌ 미사용")
+        print("\n📌 매도 핵심 조건")
+        min_hold = self.config.get('risk_management', {}).get('min_hold_minutes', 20)
+        max_hold = self.config.get('risk_management', {}).get('max_hold_minutes', 360)
+        use_partial_tp = self.config.get('risk_management', {}).get('use_partial_take_profit', False)
+        print(f"  1) 손절: 고정 손절/ATR 손절 중 더 완만한 기준")
+        print(f"  2) 트레일링: 수익 구간에서만 작동")
+        print(f"  3) 최소 보유: {min_hold}분 (과매매 억제)")
+        print(f"  4) 추세 이탈(1분+상위) 시 청산")
+        print(f"  5) 최대 보유: {max_hold}분")
+        print(f"  6) 분할 익절: {'ON' if use_partial_tp else 'OFF(기본 전량)'}")
         
         print("\n💰 투자 금액")
         if self.config['trading'].get('dynamic_allocation', False):
@@ -646,7 +644,6 @@ class TradingBot:
         total_profit = 0.0
         total_profit_after_fees = 0.0
         turnover_krw = 0.0
-        turnover_krw = 0.0
 
         def _paf(tr):
             paf = tr.get('profit_after_fees_krw', None)
@@ -671,7 +668,6 @@ class TradingBot:
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
                 turnover_krw += (buy_price * amount) + (sell_price * amount)
-                turnover_krw += (buy_price * amount) + (sell_price * amount)
 
                 buy_fee = t.get('buy_fee_krw', None)
                 sell_fee = t.get('sell_fee_krw', None)
@@ -687,7 +683,6 @@ class TradingBot:
         wins = [t for t in today_trades if _paf(t) > 0]
         losses = [t for t in today_trades if _paf(t) <= 0]
         total_fee_sum = buy_fee_sum + sell_fee_sum
-        fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
         fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
         
         message = f"""📅 <b>일일 통계</b>
@@ -768,6 +763,7 @@ class TradingBot:
         sell_fee_sum = 0.0
         total_profit = 0.0
         total_profit_after_fees = 0.0
+        turnover_krw = 0.0
 
         for t in week_trades:
             try:
@@ -777,6 +773,7 @@ class TradingBot:
                 buy_price = float(t.get('buy_price', 0) or 0)
                 sell_price = float(t.get('sell_price', 0) or 0)
                 amount = float(t.get('amount', 0) or 0)
+                turnover_krw += (buy_price * amount) + (sell_price * amount)
 
                 buy_fee = t.get('buy_fee_krw', None)
                 sell_fee = t.get('sell_fee_krw', None)
@@ -794,6 +791,7 @@ class TradingBot:
         win_rate = (len(wins) / len(week_trades) * 100) if week_trades else 0
 
         total_fee_sum = buy_fee_sum + sell_fee_sum
+        fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
         
         best = max(week_trades, key=_paf)
         worst = min(week_trades, key=_paf)

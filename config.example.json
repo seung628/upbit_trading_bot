@@ -53,6 +53,23 @@
     "macd_signal": 9,
     "min_signals_required": 3
   },
+  "strategy": {
+    "_comment": "비용 민감 추세 돌파 전략 (권장)",
+    "mode": "trend_breakout",
+    "entry_interval": "minute1",
+    "htf_interval": "minute15",
+    "entry_breakout_lookback": 20,
+    "_comment_breakout_buffer": "돌파 버퍼(%) 예: 0.05 => 직전 고점 대비 +0.05%",
+    "entry_breakout_buffer_pct": 0.05,
+    "entry_volume_ratio_min": 1.6,
+    "entry_rsi_min": 52,
+    "entry_rsi_max": 72,
+    "entry_ma_fast": 20,
+    "entry_ma_slow": 60,
+    "htf_ma_fast": 20,
+    "htf_ma_slow": 50,
+    "entry_min_score": 8
+  },
   "risk_management": {
     "_comment": "리스크 관리 설정",
     "use_atr": true,
@@ -65,6 +82,11 @@
     "take_profit_1_ratio": 0.5,
     "take_profit_2_pct": 3.0,
     "take_profit_2_ratio": 0.3,
+    "_comment_partial": "분할 익절은 수수료 증가 요인이 될 수 있어 기본 OFF 권장",
+    "use_partial_take_profit": false,
+    "_comment_hold": "과매매/수수료 드래그 억제를 위한 최소/최대 보유시간(분)",
+    "min_hold_minutes": 20,
+    "max_hold_minutes": 360,
     "trailing_stop_pct": 1.0,
     "trailing_activation_pct": 2.0
   },
