@@ -33,6 +33,15 @@ class TradingLogger:
         """메인 시스템 로거"""
         logger = logging.getLogger('TradingBot')
         logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        # 재초기화 시 핸들러 중복 방지
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
         
         # 콘솔 핸들러
         console_handler = logging.StreamHandler()
@@ -67,6 +76,14 @@ class TradingLogger:
         """거래 전용 로거 (CSV 형식)"""
         logger = logging.getLogger('TradeLog')
         logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
         
         # 거래 로그 파일 핸들러
         trade_handler = TimedRotatingFileHandler(
@@ -92,6 +109,14 @@ class TradingLogger:
         """통계 로거"""
         logger = logging.getLogger('StatsLog')
         logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
         
         stats_handler = TimedRotatingFileHandler(
             filename=os.path.join(self.log_dir, 'statistics.log'),
@@ -112,6 +137,13 @@ class TradingLogger:
         logger = logging.getLogger('DecisionLog')
         logger.setLevel(logging.INFO)
         logger.propagate = False
+
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
 
         decision_handler = TimedRotatingFileHandler(
             filename=os.path.join(self.log_dir, 'decisions.log'),

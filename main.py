@@ -52,6 +52,11 @@ class TradingBot:
         self.buy_amount_krw = self.config['trading']['buy_amount_krw']
         self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
         self.dynamic_allocation = self.config['trading'].get('dynamic_allocation', False)
+        try:
+            mpr = float(self.config['trading'].get('max_position_ratio', 0.45))
+            self.max_position_ratio = max(0.10, min(1.0, mpr))
+        except Exception:
+            self.max_position_ratio = 0.45
         _auto = self.config['trading'].get('auto_start_on_launch', True)
         self.auto_start_on_launch = True if _auto is None else bool(_auto)
         self.check_interval = self.config['trading']['check_interval_seconds']
@@ -59,6 +64,7 @@ class TradingBot:
         self.empty_list_retry_seconds = self.config['coin_selection'].get('empty_list_retry_seconds', 60)
         self.empty_list_retry_max_seconds = self.config['coin_selection'].get('empty_list_retry_max_seconds', 600)
         self._empty_list_fail_count = 0
+        self.last_buy_attempt_candle = {}  # ticker -> candle_ts
         
         # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
         try:
@@ -276,6 +282,7 @@ class TradingBot:
             print(f"  ✅ 동적 투자:")
             print(f"     기본 금액: {self.config['trading']['buy_amount_krw']:,}원")
             print(f"     최대 한도: {self.config['trading']['max_total_investment']:,}원")
+            print(f"     포지션당 상한: {self.max_position_ratio*100:.0f}%")
             print(f"     운용: 한도 내 슬롯 기반 배분 + 점수 가중")
             print(f"     점수 11점+: 강한 가중(우선 배분)")
             print(f"     점수 9-10점: 중간 가중")
@@ -1495,7 +1502,7 @@ class TradingBot:
         
         return False
     
-    def _calculate_dynamic_investment(self, signal_score, available_krw=None):
+    def _calculate_dynamic_investment(self, signal_score, available_krw=None, buy_meta=None, orderbook_details=None):
         """투자 금액 계산 (총 투자 한도 고정 + 점수 기반 효율 배분)."""
 
         min_trade = float(self.config['trading']['min_trade_amount'])
@@ -1555,6 +1562,51 @@ class TradingBot:
         legacy_target = min(float(self.buy_amount_krw) * legacy_multiplier, tradable_budget)
         slot_target = slot_budget * slot_boost
         target = max(legacy_target, slot_target)
+
+        # 포지션당 최대 집중도 제한 (한 종목 과집중 방지)
+        per_position_cap = float(self.max_total_investment) * float(self.max_position_ratio)
+        per_position_cap = max(min_trade, per_position_cap)
+        target = min(target, per_position_cap)
+
+        # 변동성(ATR) + 체결비용(스프레드) 기반 리스크 가중
+        risk_scale = 1.0
+        meta = buy_meta if isinstance(buy_meta, dict) else {}
+        ob = orderbook_details if isinstance(orderbook_details, dict) else {}
+
+        atr_pct = meta.get("atr_pct")
+        try:
+            atr_pct = float(atr_pct) if atr_pct is not None else None
+        except Exception:
+            atr_pct = None
+        if atr_pct is not None:
+            if atr_pct >= 1.20:
+                risk_scale *= 0.75
+            elif atr_pct >= 0.90:
+                risk_scale *= 0.85
+            elif atr_pct <= 0.35:
+                risk_scale *= 1.05
+
+        spread_pct = ob.get("spread_pct")
+        try:
+            spread_pct = float(spread_pct) if spread_pct is not None else None
+        except Exception:
+            spread_pct = None
+        if spread_pct is not None:
+            if spread_pct >= 0.45:
+                risk_scale *= 0.80
+            elif spread_pct >= 0.35:
+                risk_scale *= 0.90
+
+        volume_ratio = meta.get("volume_ratio")
+        try:
+            volume_ratio = float(volume_ratio) if volume_ratio is not None else None
+        except Exception:
+            volume_ratio = None
+        if volume_ratio is not None and volume_ratio >= 2.5:
+            risk_scale *= 1.05
+
+        risk_scale = max(0.60, min(1.20, risk_scale))
+        target *= risk_scale
 
         # 남은 슬롯을 위해 최소 주문 가능 금액은 보존
         reserve_for_others = min_trade * max(0, slots_left - 1)
@@ -1836,7 +1888,12 @@ class TradingBot:
 
                         # 분석 로그: 점수는 충분한데(또는 근접한데) 품질 필터로 차단된 케이스 기록
                         try:
-                            min_score = int(self.config.get('indicators', {}).get('min_signal_score', 7) or 7)
+                            min_score = int(
+                                self.config.get('strategy', {}).get(
+                                    'entry_min_score',
+                                    self.config.get('indicators', {}).get('min_signal_score', 7)
+                                ) or 7
+                            )
                         except Exception:
                             min_score = 7
                         if (
@@ -1857,6 +1914,13 @@ class TradingBot:
                             )
                         
                         if buy_signal and current_price:
+                            candle_ts = str((buy_meta or {}).get("candle_ts") or "")
+                            if candle_ts:
+                                if self.last_buy_attempt_candle.get(ticker) == candle_ts:
+                                    self.logger.debug(f"  {ticker} 동일 확정봉 재시도 스킵: {candle_ts}")
+                                    continue
+                                self.last_buy_attempt_candle[ticker] = candle_ts
+
                             # 분석 로그 (매수 시그널 발생)
                             self.logger.log_decision(
                                 "BUY_SIGNAL",
@@ -1902,7 +1966,9 @@ class TradingBot:
                                 available_krw = 0.0
                             invest_amount = self._calculate_dynamic_investment(
                                 signal_score,
-                                available_krw=available_krw
+                                available_krw=available_krw,
+                                buy_meta=buy_meta,
+                                orderbook_details=orderbook_details,
                             )
                             
                             if invest_amount >= self.config['trading']['min_trade_amount']:

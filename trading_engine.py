@@ -211,6 +211,9 @@ class TradingEngine:
                 "ask_size": float(ask_size),
                 "bid_size": float(bid_size),
             }
+
+            if ask_price <= 0 or bid_price <= 0:
+                return False, "호가 가격 이상", details
             
             # 스프레드 체크
             spread_pct = ((ask_price - bid_price) / bid_price) * 100
@@ -374,6 +377,7 @@ class TradingEngine:
             price = float(current.get('close', 0) or 0)
             prev_price = float(prev.get('close', 0) or 0)
             rsi_value = float(current.get('rsi', 0) or 0)
+            atr_value = float(current.get('atr', 0) or 0) if not pd.isna(current.get('atr')) else None
             volume_ratio = float((current.get('volume', 0) or 0) / (current.get('volume_ma', 1) or 1))
             macd_cross = bool(prev['macd'] <= prev['macd_signal'] and current['macd'] > current['macd_signal'])
 
@@ -478,6 +482,8 @@ class TradingEngine:
                 "close": price,
                 "prev_close": prev_price,
                 "rsi": rsi_value,
+                "atr": float(atr_value) if atr_value is not None else None,
+                "atr_pct": (float(atr_value) / price * 100) if (atr_value is not None and price > 0) else None,
                 "volume_ratio": float(volume_ratio),
                 "macd_golden_cross": bool(macd_cross),
                 "breakout_base": float(breakout_base),
@@ -688,17 +694,17 @@ class TradingEngine:
             if current_price is None:
                 return None
             
-            total_executed_volume = 0
-            total_executed_value = 0
-            total_fees = 0
-            
             # 주문 방식 결정
             if self.order_type == 'limit_with_fallback':
                 # 1단계: 지정가 주문 시도
                 orderbook = pyupbit.get_orderbook(ticker)
                 if orderbook and 'orderbook_units' in orderbook:
                     bid_price = orderbook['orderbook_units'][0]['bid_price']
-                    buy_amount = invest_amount / bid_price
+                    if bid_price <= 0:
+                        return None
+                    buy_amount = round(invest_amount / bid_price, 8)
+                    if buy_amount <= 0:
+                        return None
                     
                     self.logger.debug(f"  {ticker} 지정가 매수 시도: {bid_price:,.0f}원")
                     
@@ -716,7 +722,6 @@ class TradingEngine:
                         
                         if order_info:
                             executed_volume = float(order_info.get('executed_volume', 0))
-                            trades_count = int(order_info.get('trades_count', 0))
                             
                             # 완전 체결
                             if order_info['state'] == 'done':
@@ -1113,10 +1118,13 @@ class TradingEngine:
     def get_balance(self, currency="KRW"):
         """잔고 조회"""
         try:
-            return self.upbit.get_balance(currency)
+            value = self.upbit.get_balance(currency)
+            if value is None:
+                return 0.0
+            return float(value)
         except Exception as e:
             self.logger.log_error("잔고 조회 오류", e)
-            return 0
+            return 0.0
     
     def get_current_price(self, ticker):
         """현재가 조회"""
