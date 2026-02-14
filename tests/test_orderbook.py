@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from trading_engine import TradingEngine
@@ -44,6 +45,11 @@ class FakeStats:
         self.positions = {}
 
     def save_positions(self):
+        return None
+
+    def update_position_highest(self, ticker, highest_price):
+        if ticker in self.positions:
+            self.positions[ticker]["highest_price"] = highest_price
         return None
 
 
@@ -124,6 +130,11 @@ def make_config(min_depth=1000):
             "signal_candle_minutes": 20,
             "analysis_lookback": 240,
             "mode": "regime_spec",
+            "symbol_strategy_map": {
+                "SOL": {"strategy": "SOL_TREND", "regimes": ["BULL"]},
+                "XRP": {"strategy": "XRP_FLOW", "regimes": ["BULL", "RANGE"]},
+                "ADA": {"strategy": "ADA_RANGE", "regimes": ["RANGE"]},
+            },
             "regime_reference": "KRW-BTC",
             "regime_check_minutes": 20,
             "regime_confirm_count": 3,
@@ -132,7 +143,7 @@ def make_config(min_depth=1000):
             "entry_time_filter": {"start_hour": 2, "end_hour": 6},
             "volatility_tr_atr_max": 3.0,
             "btc_filter": {"enabled": True, "ticker": "KRW-BTC", "ema_period": 50},
-            "universe": ["SOL", "DOGE", "ADA"],
+            "universe": ["SOL", "XRP", "ADA"],
         },
         "risk_management": {
             "atr_period": 14,
@@ -149,6 +160,29 @@ def make_config(min_depth=1000):
 
 
 class TradingEngineOrderbookTests(unittest.TestCase):
+    @staticmethod
+    def _xrp_state(**overrides):
+        base = {
+            "ticker": "KRW-XRP",
+            "candle_ts": "2026-02-15 00:00:00",
+            "close": 100.0,
+            "rsi": 60.0,
+            "atr": 1.5,
+            "atr_pct": 1.5,
+            "tr_atr_ratio": 1.0,
+            "volume_ratio": 1.4,
+            "range_position": 0.5,
+            "middle_zone": False,
+            "breakout_level": 98.0,
+            "swing_low": 90.0,
+            "swing_high": 110.0,
+            "quality_score": 20.0,
+            "xrp_trend_ok": True,
+            "xrp_pullback_to_ema20": True,
+        }
+        base.update(overrides)
+        return base
+
     def test_limit_with_fallback_normalizes_orderbook_list_and_dict(self):
         for orderbook_payload in (
             [{"orderbook_units": [{"bid_price": 100.0, "ask_price": 101.0}]}],
@@ -261,6 +295,100 @@ class TradingEngineOrderbookTests(unittest.TestCase):
         self.assertTrue(logger.has_info("LIMIT_ORDER_TIMEOUT_CANCEL_RESULT"))
         self.assertTrue(logger.has_warning("ABORT_FALLBACK_UNKNOWN_STATE"))
         self.assertFalse(logger.has_error("FALLBACK_ABORTED"))
+
+    def test_select_strategy_supports_xrp_flow(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        state = {"ticker": "KRW-XRP"}
+
+        self.assertEqual(engine.select_strategy(state, "BULL"), "XRP_FLOW")
+        self.assertEqual(engine.select_strategy(state, "RANGE"), "XRP_FLOW")
+        self.assertIsNone(engine.select_strategy(state, "BEAR"))
+
+    def test_select_strategy_uses_symbol_strategy_map_config(self):
+        config = make_config()
+        config["strategy"]["symbol_strategy_map"] = {
+            "SUI": {"strategy": "DOGE_MOMENTUM", "regimes": ["ANY"]},
+        }
+        logger = FakeLogger()
+        engine = TradingEngine(config, logger, FakeStats())
+
+        self.assertEqual(engine.select_strategy({"ticker": "KRW-SUI"}, "BULL"), "DOGE_MOMENTUM")
+        self.assertEqual(engine.select_strategy({"ticker": "KRW-SUI"}, "BEAR"), "DOGE_MOMENTUM")
+        self.assertIsNone(engine.select_strategy({"ticker": "KRW-XRP"}, "BULL"))
+
+    def test_xrp_buy_signal_passes_with_valid_state(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        engine.update_global_regime = lambda force=False: ("BULL", {})
+        engine._check_btc_trend_filter = lambda: (True, {"enabled": True})
+        engine._is_entry_time_blocked = lambda: False
+        engine.analyze_symbol = lambda ticker: self._xrp_state()
+        engine._size_by_risk = lambda ticker, entry_price, stop_price: {
+            "equity_krw": 500000.0,
+            "risk_krw": 2000.0,
+            "risk_pct": 0.4,
+            "qty_by_risk": 100.0,
+            "risk_invest_krw": 10000.0,
+            "weight_cap_krw": 200000.0,
+            "weight_remaining_krw": 200000.0,
+            "total_cap_remaining_krw": 200000.0,
+            "recommended_invest_krw": 10000.0,
+        }
+
+        buy_signal, _, _, _, meta = engine.check_buy_signal("KRW-XRP")
+
+        self.assertTrue(buy_signal)
+        self.assertEqual(meta.get("strategy"), "XRP_FLOW")
+        self.assertEqual(meta.get("blocked_by"), [])
+
+    def test_xrp_buy_signal_blocks_on_rsi_band(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        engine.update_global_regime = lambda force=False: ("BULL", {})
+        engine._check_btc_trend_filter = lambda: (True, {"enabled": True})
+        engine._is_entry_time_blocked = lambda: False
+        engine.analyze_symbol = lambda ticker: self._xrp_state(rsi=80.0)
+        engine._size_by_risk = lambda ticker, entry_price, stop_price: {
+            "equity_krw": 500000.0,
+            "risk_krw": 2000.0,
+            "risk_pct": 0.4,
+            "qty_by_risk": 100.0,
+            "risk_invest_krw": 10000.0,
+            "weight_cap_krw": 200000.0,
+            "weight_remaining_krw": 200000.0,
+            "total_cap_remaining_krw": 200000.0,
+            "recommended_invest_krw": 10000.0,
+        }
+
+        buy_signal, _, _, _, meta = engine.check_buy_signal("KRW-XRP")
+
+        self.assertFalse(buy_signal)
+        self.assertIn("XRPRSI밴드미충족", meta.get("blocked_by", []))
+
+    def test_xrp_sell_signal_time_stop(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        engine.analyze_symbol = lambda ticker: self._xrp_state()
+        engine.get_current_price = lambda ticker: 101.0
+
+        position = {
+            "buy_price": 100.0,
+            "highest_price": 101.0,
+            "amount": 10.0,
+            "timestamp": datetime.now() - timedelta(minutes=120),
+            "buy_meta": {
+                "strategy": "XRP_FLOW",
+                "stop_price": 99.0,
+                "target_r": 1.2,
+                "time_stop_candles": 2,
+            },
+        }
+
+        should_sell, reason, _, _ = engine.check_sell_signal("KRW-XRP", position)
+
+        self.assertTrue(should_sell)
+        self.assertIn("XRP 시간청산", reason)
 
 
 if __name__ == "__main__":

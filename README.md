@@ -6,7 +6,7 @@
 ## 현재 전략 요약
 
 - 유니버스: `KRW-SOL`, `KRW-DOGE`, `KRW-ADA`
-- 최대 동시 포지션: 2개
+- 최대 동시 포지션: 설정값(`strategy.max_positions`, 기본 3)
 - 신규 진입 차단 시간: 02:00~06:00 (로컬 서버 시간)
 - BTC 필터: 20분봉 기준 `KRW-BTC 종가 > EMA50`
 - 변동성 필터: `TR / ATR(14) <= 3.0`
@@ -77,6 +77,9 @@ pip install -r requirements.txt
 - `api.access_key`
 - `api.secret_key`
 
+권장:
+- `strategy.symbol_strategy_map` (종목별 전략/레짐 매핑)
+
 ### 3) 실행
 
 ```bash
@@ -88,6 +91,8 @@ python main.py
 ## 현재 사용되는 주요 설정 키
 
 `strategy`:
+- `symbol_strategy_map`
+- `universe`
 - `max_positions`
 
 `trading`:

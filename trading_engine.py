@@ -86,12 +86,23 @@ class TradingEngine:
         self.doge_time_stop_candles = int(strategy_cfg.get("doge_time_stop_candles", 6))
         self.doge_target_r = float(strategy_cfg.get("doge_target_r", 1.0))
 
+        self.xrp_volume_spike_min = float(strategy_cfg.get("xrp_volume_spike_min", 1.2))
+        self.xrp_rsi_min = float(strategy_cfg.get("xrp_rsi_min", 52))
+        self.xrp_rsi_max = float(strategy_cfg.get("xrp_rsi_max", 72))
+        self.xrp_pullback_atr_tolerance = float(strategy_cfg.get("xrp_pullback_atr_tolerance", 0.25))
+        self.xrp_stop_pct = float(strategy_cfg.get("xrp_stop_pct", 0.7)) / 100.0
+        self.xrp_time_stop_candles = int(strategy_cfg.get("xrp_time_stop_candles", 8))
+        self.xrp_target_r = float(strategy_cfg.get("xrp_target_r", 1.2))
+
         self.ada_range_lookback = int(strategy_cfg.get("ada_range_lookback", 96))
         self.ada_entry_lower_pct = float(strategy_cfg.get("ada_entry_lower_pct", 0.15))
         self.ada_take_profit_upper_pct = float(strategy_cfg.get("ada_take_profit_upper_pct", 0.85))
         self.ada_rsi_max = float(strategy_cfg.get("ada_rsi_max", 28))
         self.ada_stop_pct = float(strategy_cfg.get("ada_stop_pct", 0.9)) / 100.0
 
+        self.symbol_strategy_map, self.symbol_strategy_order = self._build_symbol_strategy_map(strategy_cfg)
+        if not self.symbol_strategy_map:
+            self.logger.warning("⚠️ strategy.symbol_strategy_map 설정이 비어 있습니다. 전략 매핑이 필요합니다.")
         self.universe = self._build_universe(strategy_cfg)
         self.base_weight_caps = self._build_weight_caps(strategy_cfg)
         self.risk_per_symbol_pct = self._build_risk_per_symbol(strategy_cfg, risk_cfg)
@@ -208,7 +219,9 @@ class TradingEngine:
     def _build_universe(self, strategy_cfg):
         raw_universe = strategy_cfg.get("universe")
         if not raw_universe:
-            raw_universe = ["SOL", "DOGE", "ADA"]
+            raw_universe = self.config.get("coin_selection", {}).get("fixed_tickers", [])
+        if not raw_universe:
+            raw_universe = list(self.symbol_strategy_order)
 
         universe = []
         for value in raw_universe:
@@ -217,12 +230,57 @@ class TradingEngine:
                 universe.append(ticker)
         return universe
 
+    def _build_symbol_strategy_map(self, strategy_cfg):
+        raw = strategy_cfg.get("symbol_strategy_map", {}) or {}
+        if not isinstance(raw, dict):
+            return {}, []
+
+        out = {}
+        order = []
+        for key, value in raw.items():
+            symbol = self._symbol(key)
+            if not symbol:
+                continue
+
+            strategy_name = ""
+            regimes = {"ANY"}
+
+            if isinstance(value, str):
+                strategy_name = str(value).upper().strip()
+            elif isinstance(value, dict):
+                strategy_name = str(value.get("strategy", "") or "").upper().strip()
+                raw_regimes = value.get("regimes", ["ANY"])
+                if isinstance(raw_regimes, str):
+                    raw_regimes = [raw_regimes]
+                regimes = set()
+                for regime in raw_regimes:
+                    token = str(regime or "").upper().strip()
+                    if not token:
+                        continue
+                    if token in {"*", "ALL"}:
+                        token = "ANY"
+                    regimes.add(token)
+                if not regimes:
+                    regimes = {"ANY"}
+            else:
+                continue
+
+            if not strategy_name:
+                continue
+
+            if symbol not in out:
+                order.append(symbol)
+            out[symbol] = {
+                "strategy": strategy_name,
+                "regimes": set(regimes),
+            }
+
+        return out, order
+
     def _build_weight_caps(self, strategy_cfg):
-        default_caps = {
-            "SOL": 0.50,
-            "DOGE": 0.40,
-            "ADA": 0.35,
-        }
+        default_cap = self._safe_float(strategy_cfg.get("default_weight_cap", 0.0), 0.0)
+        default_cap = max(0.0, min(1.0, default_cap))
+        default_caps = {symbol: float(default_cap) for symbol in self.symbol_strategy_order}
         raw_caps = strategy_cfg.get("base_weight_caps", {}) or {}
         for key, value in raw_caps.items():
             symbol = self._symbol(key)
@@ -231,11 +289,7 @@ class TradingEngine:
         return default_caps
 
     def _build_risk_per_symbol(self, strategy_cfg, risk_cfg):
-        default = {
-            "SOL": 0.005,
-            "DOGE": 0.004,
-            "ADA": 0.003,
-        }
+        default = {symbol: float(self.default_risk_per_trade_pct) for symbol in self.symbol_strategy_order}
         raw = strategy_cfg.get("risk_per_symbol_pct", {}) or risk_cfg.get("risk_per_symbol_pct", {}) or {}
         for key, value in raw.items():
             symbol = self._symbol(key)
@@ -851,6 +905,9 @@ class TradingEngine:
             structure = "RANGE"
 
         pullback_to_ema20 = abs(close - ema20) <= max(atr * self.doge_pullback_atr_tolerance, close * 0.0025)
+        xrp_pullback_to_ema20 = abs(close - ema20) <= max(atr * self.xrp_pullback_atr_tolerance, close * 0.0020)
+        xrp_trend_ok = close >= ema20 >= ema50
+        xrp_rsi_band = self.xrp_rsi_min <= rsi <= self.xrp_rsi_max
         volatility_ok = tr_atr_ratio <= self.volatility_tr_atr_max
         trend_bias_pct = ((ema50 / ema200) - 1.0) * 100.0 if ema200 > 0 else 0.0
 
@@ -860,6 +917,8 @@ class TradingEngine:
         quality_score += 10.0 if breakout_above else 0.0
         quality_score += 8.0 if retest_ok_sol else 0.0
         quality_score += 8.0 if pullback_to_ema20 else 0.0
+        quality_score += 8.0 if xrp_pullback_to_ema20 else 0.0
+        quality_score += 6.0 if xrp_trend_ok else 0.0
         quality_score += 10.0 if ada_in_lower_zone else 0.0
         quality_score += 8.0 if range_bounce else 0.0
 
@@ -896,23 +955,32 @@ class TradingEngine:
             "symbol_regime": structure,
             "trend_bias_pct": float(trend_bias_pct),
             "pullback_to_ema20": bool(pullback_to_ema20),
+            "xrp_pullback_to_ema20": bool(xrp_pullback_to_ema20),
+            "xrp_trend_ok": bool(xrp_trend_ok),
+            "xrp_rsi_band_ok": bool(xrp_rsi_band),
             "ada_in_lower_zone": bool(ada_in_lower_zone),
             "ada_target_price": float(ada_target_price),
             "quality_score": float(quality_score),
         }
 
     def select_strategy(self, symbol_state, global_regime=None):
-        regime = str(global_regime or self.global_regime)
+        regime = str(global_regime or self.global_regime).upper()
         if not symbol_state:
             return None
 
         symbol = self._symbol(symbol_state.get("ticker"))
-        if symbol == "SOL":
-            return "SOL_TREND" if regime == "BULL" else None
-        if symbol == "DOGE":
-            return "DOGE_MOMENTUM"
-        if symbol == "ADA":
-            return "ADA_RANGE" if regime == "RANGE" else None
+        rule = self.symbol_strategy_map.get(symbol)
+        if not rule:
+            return None
+
+        strategy_name = str(rule.get("strategy", "")).upper().strip()
+        regimes = set(rule.get("regimes", set()) or set())
+        if not strategy_name:
+            return None
+
+        if "ANY" in regimes or regime in regimes:
+            return strategy_name
+
         return None
 
     def check_buy_signal(self, ticker):
@@ -1043,6 +1111,36 @@ class TradingEngine:
                 time_stop_candles = self.doge_time_stop_candles
                 target_r = self.doge_target_r
 
+            elif strategy == "XRP_FLOW":
+                if state.get("volume_ratio", 0) < self.xrp_volume_spike_min:
+                    block("XRP거래량미충족")
+                else:
+                    score += 2
+                    signals.append("거래량확인")
+
+                rsi_value = float(state.get("rsi", 0) or 0)
+                if rsi_value < self.xrp_rsi_min or rsi_value > self.xrp_rsi_max:
+                    block("XRPRSI밴드미충족")
+                else:
+                    score += 1
+                    signals.append(f"RSI{self.xrp_rsi_min:.0f}-{self.xrp_rsi_max:.0f}")
+
+                if not state.get("xrp_trend_ok"):
+                    block("XRP추세정렬미충족")
+                else:
+                    score += 2
+                    signals.append("EMA정렬")
+
+                if not state.get("xrp_pullback_to_ema20"):
+                    block("XRPEMA20풀백미충족")
+                else:
+                    score += 2
+                    signals.append("EMA20풀백")
+
+                stop_price = entry_price * (1.0 - self.xrp_stop_pct)
+                time_stop_candles = self.xrp_time_stop_candles
+                target_r = self.xrp_target_r
+
             elif strategy == "ADA_RANGE":
                 if state.get("rsi", 100) > self.ada_rsi_max:
                     block("ADARSI과매도미충족")
@@ -1130,6 +1228,14 @@ class TradingEngine:
                     {
                         "target_r": float(self.doge_target_r),
                         "time_stop_candles": int(self.doge_time_stop_candles),
+                    }
+                )
+            elif strategy == "XRP_FLOW":
+                meta.update(
+                    {
+                        "target_r": float(self.xrp_target_r),
+                        "time_stop_candles": int(self.xrp_time_stop_candles),
+                        "rsi_band": [float(self.xrp_rsi_min), float(self.xrp_rsi_max)],
                     }
                 )
             elif strategy == "ADA_RANGE":
@@ -1273,6 +1379,29 @@ class TradingEngine:
 
                 if hold_candles >= time_stop_candles and progress_r < target_r:
                     reason = f"DOGE 시간청산({hold_candles:.1f}캔들,{progress_r:.2f}R)"
+                    meta["reason"] = reason
+                    meta["r_multiple"] = float(progress_r)
+                    return True, reason, 1.0, meta
+
+            elif strategy == "XRP_FLOW":
+                target_r = self._safe_float(buy_meta.get("target_r", self.xrp_target_r), self.xrp_target_r)
+                time_stop_candles = int(
+                    self._safe_float(
+                        buy_meta.get("time_stop_candles", self.xrp_time_stop_candles),
+                        self.xrp_time_stop_candles,
+                    )
+                )
+                meta["target_r"] = float(target_r)
+                meta["time_stop_candles"] = int(time_stop_candles)
+
+                if progress_r >= target_r:
+                    reason = f"XRP 목표도달({progress_r:.2f}R)"
+                    meta["reason"] = reason
+                    meta["r_multiple"] = float(progress_r)
+                    return True, reason, 1.0, meta
+
+                if hold_candles >= time_stop_candles and progress_r < target_r:
+                    reason = f"XRP 시간청산({hold_candles:.1f}캔들,{progress_r:.2f}R)"
                     meta["reason"] = reason
                     meta["r_multiple"] = float(progress_r)
                     return True, reason, 1.0, meta

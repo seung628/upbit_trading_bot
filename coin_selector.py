@@ -46,7 +46,11 @@ class CoinSelector:
             return float(default)
 
     def _build_universe(self, raw_universe):
-        values = raw_universe if raw_universe else ["SOL", "DOGE", "ADA"]
+        if raw_universe:
+            values = raw_universe
+        else:
+            strategy_cfg = self.config.get("strategy", {}) or {}
+            values = list((strategy_cfg.get("symbol_strategy_map", {}) or {}).keys())
         out = []
         for value in values:
             ticker = self._normalize_ticker(value)

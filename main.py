@@ -312,10 +312,42 @@ class TradingBot:
         regime_confirm_count = strategy_cfg.get("regime_confirm_count", 3)
         regime_min_hold_minutes = strategy_cfg.get("regime_min_hold_minutes", 0)
         max_positions = strategy_cfg.get("max_positions", self.max_coins)
-        universe = strategy_cfg.get("universe", ["SOL", "DOGE", "ADA"])
+        symbol_strategy_map = strategy_cfg.get("symbol_strategy_map", {}) or {}
+        universe = (
+            strategy_cfg.get("universe", [])
+            or self.config.get("coin_selection", {}).get("fixed_tickers", [])
+            or list(symbol_strategy_map.keys())
+        )
         no_entry = strategy_cfg.get("entry_time_filter", {}) or {}
         btc_filter = strategy_cfg.get("btc_filter", {}) or {}
         risk_per_symbol = strategy_cfg.get("risk_per_symbol_pct", {}) or risk_cfg.get("risk_per_symbol_pct", {}) or {}
+
+        strategy_desc = {
+            "SOL_TREND": "48봉 돌파+리테스트",
+            "XRP_FLOW": "거래량 확인 + RSI 밴드 + EMA 정렬/풀백",
+            "DOGE_MOMENTUM": "거래량 스파이크 + RSI 모멘텀 + EMA20 풀백",
+            "ADA_RANGE": "RSI 과매도 + 96봉 하단 15%",
+        }
+        exit_desc = {
+            "SOL_TREND": "손절 0.5*ATR, 1.2R 30% 익절, 2.2R 이후 트레일링",
+            "XRP_FLOW": (
+                f"손절 -{float(strategy_cfg.get('xrp_stop_pct', 0.7) or 0.7):.1f}%, "
+                f"{int(strategy_cfg.get('xrp_time_stop_candles', 8) or 8)}캔들 시간청산"
+            ),
+            "DOGE_MOMENTUM": (
+                f"손절 -{float(strategy_cfg.get('doge_stop_pct', 0.8) or 0.8):.1f}%, "
+                f"{int(strategy_cfg.get('doge_time_stop_candles', 6) or 6)}캔들 시간청산"
+            ),
+            "ADA_RANGE": "손절 -0.9%, 96봉 상단 85% 목표청산",
+        }
+
+        def resolve_strategy_for_symbol(symbol):
+            rule = symbol_strategy_map.get(symbol) or symbol_strategy_map.get(f"KRW-{symbol}")
+            if isinstance(rule, str):
+                return str(rule).upper().strip()
+            if isinstance(rule, dict):
+                return str(rule.get("strategy", "") or "").upper().strip()
+            return ""
 
         if market_snapshot is None:
             market_snapshot = self._get_market_snapshot(probe=True)
@@ -332,15 +364,20 @@ class TradingBot:
             print(f"  {line}")
 
         print("\n📌 레짐별 전략")
-        print("  SOL: BULL 레짐에서 48봉 돌파+리테스트")
-        print("  DOGE: 거래량 스파이크 + RSI 모멘텀 + EMA20 풀백")
-        print("  ADA: RANGE 레짐에서 RSI 과매도 + 96봉 하단 15%")
+        if universe:
+            for item in universe:
+                symbol = self._to_symbol(item)
+                strategy_name = resolve_strategy_for_symbol(symbol)
+                detail = strategy_desc.get(strategy_name, "전략 설명 없음")
+                print(f"  {symbol}: {detail}")
+        else:
+            print("  (유니버스/전략 매핑 설정 필요)")
 
         print("\n📌 공통 진입 게이트")
         print(f"  1) 시간 필터: {no_entry.get('start_hour', 2):02d}:00~{no_entry.get('end_hour', 6):02d}:00 신규 진입 차단")
         print(f"  2) BTC 필터: {btc_filter.get('ticker', 'KRW-BTC')} 종가 > EMA{btc_filter.get('ema_period', 50)}")
         print(f"  3) 변동성 필터: TR/ATR <= {strategy_cfg.get('volatility_tr_atr_max', 3.0)}")
-        print("  4) 동시 포지션 최대 2개")
+        print(f"  4) 동시 포지션 최대 {max_positions}개")
 
         time_stop_candles = risk_cfg.get("time_stop_candles", 10)
         risk_per_trade_pct = risk_cfg.get("risk_per_trade_pct", 1.0)
@@ -348,10 +385,15 @@ class TradingBot:
         max_hold = risk_cfg.get("max_hold_minutes", 360)
 
         print("\n📌 손절/청산 핵심")
-        print("  1) SOL: 손절 0.5*ATR, 1.2R 30% 익절, 2.2R 이후 트레일링")
-        print("  2) DOGE: 손절 -0.8%, 6캔들 시간청산")
-        print("  3) ADA: 손절 -0.9%, 96봉 상단 85% 목표청산")
-        print(f"  4) 공통 최대보유: {max_hold}분 (기본 시간손절 {time_stop_candles}캔들)")
+        if universe:
+            for idx, item in enumerate(universe, start=1):
+                symbol = self._to_symbol(item)
+                strategy_name = resolve_strategy_for_symbol(symbol)
+                detail = exit_desc.get(strategy_name, "설정 기반 손절/청산")
+                print(f"  {idx}) {symbol}: {detail}")
+            print(f"  {len(universe) + 1}) 공통 최대보유: {max_hold}분 (기본 시간손절 {time_stop_candles}캔들)")
+        else:
+            print(f"  1) 공통 최대보유: {max_hold}분 (기본 시간손절 {time_stop_candles}캔들)")
 
         print("\n💰 자금 운용")
         print(f"  최대 투자 한도: {self.max_total_investment:,.0f}원")
@@ -474,7 +516,8 @@ class TradingBot:
         coin_cfg = self.config.get("coin_selection", {}) or {}
         strategy_cfg = self.config.get("strategy", {}) or {}
 
-        raw = coin_cfg.get("fixed_tickers", []) or strategy_cfg.get("universe", []) or ["SOL", "DOGE", "ADA"]
+        map_keys = list((strategy_cfg.get("symbol_strategy_map", {}) or {}).keys())
+        raw = coin_cfg.get("fixed_tickers", []) or strategy_cfg.get("universe", []) or map_keys
         excluded = {self._to_symbol(c) for c in coin_cfg.get("excluded_coins", []) if c}
 
         out = []
