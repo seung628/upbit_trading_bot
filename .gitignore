@@ -1,0 +1,7 @@
+config.json
+.env
+__pycache__/
+logs/
+trade_history/
+positions_snapshot.json
+final_stats_*.json
