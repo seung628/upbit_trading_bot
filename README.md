@@ -84,9 +84,13 @@ python main.py
 
 `trading.auto_start_on_launch=true`면 실행 직후 자동으로 트레이딩이 시작됩니다.
 
-## 현재 사용되는 주요 `trading` 설정 키
+## 현재 사용되는 주요 설정 키
 
-- `max_coins`
+`strategy`:
+- `max_positions`
+
+`trading`:
+
 - `max_total_investment`
 - `analysis_heartbeat_minutes`
 - `fee_pct`

@@ -58,7 +58,7 @@ class TradingEngine:
         self.regime_check_minutes = int(strategy_cfg.get("regime_check_minutes", 20))
         self.regime_confirm_count = int(strategy_cfg.get("regime_confirm_count", 3))
         self.regime_min_hold_minutes = int(strategy_cfg.get("regime_min_hold_minutes", 0))
-        self.max_positions = int(strategy_cfg.get("max_positions", trading_cfg.get("max_coins", 2)))
+        self.max_positions = int(strategy_cfg.get("max_positions", 2))
 
         time_filter_cfg = strategy_cfg.get("entry_time_filter", {}) or {}
         self.entry_block_start_hour = int(time_filter_cfg.get("start_hour", 2))

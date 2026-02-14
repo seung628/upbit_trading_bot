@@ -7,7 +7,6 @@
   },
   "trading": {
     "_comment": "거래 기본 설정",
-    "max_coins": 2,
     "max_total_investment": 500000,
     "analysis_heartbeat_minutes": 10,
     "fee_pct": 0.05,
@@ -65,7 +64,7 @@
       "DOGE": 0.45,
       "ADA": 0.35
     },
-    "max_positions": 2,
+    "max_positions": 3,
     "regime_reference": "KRW-BTC",
     "regime_check_minutes": 20,
     "regime_confirm_count": 3,
@@ -111,12 +110,7 @@
     "min_hold_minutes": 20,
     "max_hold_minutes": 360,
     "trailing_stop_pct": 1.0,
-    "trailing_activation_pct": 2.0,
-    "risk_per_symbol_pct": {
-      "SOL": 0.5,
-      "DOGE": 0.4,
-      "ADA": 0.3
-    }
+    "trailing_activation_pct": 2.0
   },
   "logging": {
     "log_dir": "logs",

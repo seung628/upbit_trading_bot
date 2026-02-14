@@ -44,21 +44,26 @@ class TradingBot:
         self.buying_in_progress = set()  # 현재 매수 중인 코인들
         self.buy_lock = threading.Lock()  # 매수 Lock
         
-        # 설정값
+        # 설정값: 최대 동시 포지션은 strategy.max_positions 단일 기준
+        trading_cfg = self.config.get('trading', {}) or {}
+        strategy_cfg = self.config.get('strategy', {}) or {}
+        engine_max_positions = getattr(self.engine, "max_positions", None)
         try:
-            requested_max = int(self.config['trading'].get('max_coins', 3))
+            configured_max_positions = int(
+                strategy_cfg.get('max_positions', engine_max_positions if engine_max_positions is not None else 3)
+            )
         except Exception:
-            requested_max = 3
-        engine_max = int(getattr(self.engine, "max_positions", requested_max) or requested_max)
-        self.max_coins = max(1, min(requested_max, engine_max))
-        self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
-        _auto = self.config['trading'].get('auto_start_on_launch', True)
+            configured_max_positions = int(engine_max_positions or 3)
+
+        self.max_coins = max(1, configured_max_positions)
+        self.max_total_investment = trading_cfg.get('max_total_investment', 300000)
+        _auto = trading_cfg.get('auto_start_on_launch', True)
         self.auto_start_on_launch = True if _auto is None else bool(_auto)
-        self.check_interval = self.config['trading']['check_interval_seconds']
+        self.check_interval = int(trading_cfg.get('check_interval_seconds', 10))
         self.last_buy_attempt_candle = {}  # ticker -> candle_ts
         self._last_buy_block_signature = {}  # ticker -> dedupe signature
         try:
-            hb = int(self.config['trading'].get('analysis_heartbeat_minutes', 10))
+            hb = int(trading_cfg.get('analysis_heartbeat_minutes', 10))
             self.analysis_heartbeat_minutes = max(1, hb)
         except Exception:
             self.analysis_heartbeat_minutes = 10
@@ -67,22 +72,23 @@ class TradingBot:
         # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
         try:
             self.reentry_cooldown_after_stoploss_minutes = int(
-                self.config['trading'].get('reentry_cooldown_after_stoploss_minutes', 0) or 0
+                trading_cfg.get('reentry_cooldown_after_stoploss_minutes', 0) or 0
             )
         except Exception:
             self.reentry_cooldown_after_stoploss_minutes = 0
         self.reentry_cooldowns = {}  # ticker -> datetime(until)
         
         # 일일 손실 제한
-        self.daily_loss_limit = self.config['trading'].get('daily_loss_limit_percent', -5.0)
-        self.cooldown_minutes = self.config['trading'].get('cooldown_after_loss_minutes', 30)
+        self.daily_loss_limit = trading_cfg.get('daily_loss_limit_percent', -5.0)
+        self.cooldown_minutes = trading_cfg.get('cooldown_after_loss_minutes', 30)
         
         # 거래 시간 필터
-        self.trading_hours_enabled = self.config['trading']['trading_hours'].get('enabled', False)
-        self.trading_sessions = self.config['trading']['trading_hours'].get('sessions', [])
+        trading_hours_cfg = trading_cfg.get('trading_hours', {}) or {}
+        self.trading_hours_enabled = trading_hours_cfg.get('enabled', False)
+        self.trading_sessions = trading_hours_cfg.get('sessions', [])
         
         # 미기록 잔고 처리 설정
-        untracked_cfg = self.config['trading'].get('untracked_balance', {})
+        untracked_cfg = trading_cfg.get('untracked_balance', {}) or {}
         self.untracked_action = str(untracked_cfg.get('action', 'ignore')).lower()
         self.untracked_cleanup_max_krw = untracked_cfg.get('cleanup_max_krw', 20000)
         
@@ -190,7 +196,7 @@ class TradingBot:
                 "global_regime": getattr(self.engine, "global_regime", "RANGE"),
                 "protected_coins": sorted(list(self.protected_coins)),
                 "config": {
-                    "max_coins": int(self.max_coins),
+                    "max_positions": int(self.max_coins),
                     "check_interval_seconds": float(self.check_interval),
                     "analysis_heartbeat_minutes": int(self.analysis_heartbeat_minutes),
                     "max_total_investment_krw": float(self.max_total_investment),
