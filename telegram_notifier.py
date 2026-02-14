@@ -377,7 +377,14 @@ class TelegramNotifier:
         }
         return labels.get(value, value or "UNKNOWN")
 
-    def notify_market_change(self, previous_regime, current_regime, detect_meta=None, confirm_count=None):
+    def notify_market_change(
+        self,
+        previous_regime,
+        current_regime,
+        detect_meta=None,
+        confirm_count=None,
+        context_lines=None,
+    ):
         """시장 국면(레짐) 변경 알림"""
         if not self.enabled or not self.notify_market_enabled:
             return False
@@ -404,17 +411,25 @@ class TelegramNotifier:
         confirm_text = ""
         if confirm_count is not None:
             try:
-                confirm_text = f"\n전환 확정 조건: {int(confirm_count)}회 연속 확인"
+                confirm_text = f"전환 확정 조건: {int(confirm_count)}회 연속 확인"
             except Exception:
                 confirm_text = ""
 
-        message = (
-            "🌐 <b>시장 상황 변경</b>\n\n"
-            f"{prev} ➜ {curr}\n"
-            f"{market_line}"
-            f"{confirm_text}\n\n"
-            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        lines = context_lines if isinstance(context_lines, list) else []
+        lines = [str(line).strip() for line in lines if str(line).strip()]
+        message_lines = [
+            "🌐 <b>시장 상황 변경</b>",
+            "",
+            f"{prev} ➜ {curr}",
+            f"{market_line}",
+        ]
+        if confirm_text:
+            message_lines.append(confirm_text)
+        if lines:
+            message_lines.extend(["", "🧭 <b>운용 설정</b>"])
+            message_lines.extend([f"- {line}" for line in lines])
+        message_lines.extend(["", f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        message = "\n".join(message_lines)
         return self.send_message(message)
     
     def test_connection(self):

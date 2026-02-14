@@ -511,6 +511,52 @@ class TradingBot:
 
         return lines
 
+    def _build_market_notify_context_lines(self):
+        """시장 상황 변경 알림에 포함할 운용 설정 라인 생성."""
+        strategy_cfg = self.config.get("strategy", {}) or {}
+        trading_cfg = self.config.get("trading", {}) or {}
+        btc_filter = strategy_cfg.get("btc_filter", {}) or {}
+        symbol_map = strategy_cfg.get("symbol_strategy_map", {}) or {}
+        risk_map = strategy_cfg.get("risk_per_symbol_pct", {}) or {}
+
+        target = list(self.target_coins or []) or self._resolve_fixed_target_coins()
+        symbols = [self._to_symbol(t) for t in target if self._to_symbol(t)]
+        lines = []
+
+        if symbols:
+            lines.append(f"운용 종목: {', '.join(symbols)}")
+
+        mappings = []
+        for symbol in symbols:
+            rule = symbol_map.get(symbol) or symbol_map.get(f"KRW-{symbol}")
+            strategy_name = ""
+            if isinstance(rule, str):
+                strategy_name = str(rule).upper().strip()
+            elif isinstance(rule, dict):
+                strategy_name = str(rule.get("strategy", "") or "").upper().strip()
+            if strategy_name:
+                mappings.append(f"{symbol}->{strategy_name}")
+        if mappings:
+            lines.append(f"전략 매핑: {', '.join(mappings)}")
+
+        if bool(btc_filter.get("enabled", True)):
+            btc_ticker = str(btc_filter.get("ticker", "KRW-BTC") or "KRW-BTC")
+            btc_ema = int(btc_filter.get("ema_period", 50) or 50)
+            lines.append(f"BTC 필터: {btc_ticker} > EMA{btc_ema}")
+
+        spread = float(trading_cfg.get("max_spread_percent", 0.5) or 0.5)
+        depth = int(float(trading_cfg.get("min_orderbook_depth_krw", 1_500_000) or 1_500_000))
+        lines.append(f"유동성 필터: 스프레드≤{spread:.2f}% / 호가잔량≥{depth:,}원")
+
+        risk_parts = []
+        for symbol in symbols:
+            if symbol in risk_map:
+                risk_parts.append(f"{symbol}:{float(risk_map[symbol]):.2f}%")
+        if risk_parts:
+            lines.append(f"리스크: {', '.join(risk_parts)}")
+
+        return lines
+
     def _resolve_fixed_target_coins(self):
         """고정 거래 종목 목록 계산(excluded_coins 제외)."""
         coin_cfg = self.config.get("coin_selection", {}) or {}
@@ -2049,11 +2095,13 @@ class TradingBot:
                         prev_regime = str(regime_payload.get("previous", ""))
                         curr_regime = str(regime_payload.get("current", ""))
                         if applied and prev_regime and curr_regime and prev_regime != curr_regime:
+                            notify_context_lines = self._build_market_notify_context_lines()
                             sent = self.telegram.notify_market_change(
                                 previous_regime=prev_regime,
                                 current_regime=curr_regime,
                                 detect_meta=regime_payload.get("detect", {}) or {},
                                 confirm_count=regime_payload.get("confirm_count"),
+                                context_lines=notify_context_lines,
                             )
                             if sent:
                                 self.logger.info(
