@@ -41,15 +41,12 @@
     }
   },
   "coin_selection": {
-    "_comment": "고정 유니버스 + 주기적 상태 점검",
+    "_comment": "고정 유니버스(동적 종목 선정/주기 갱신 미사용)",
     "fixed_tickers": ["SOL", "DOGE", "ADA"],
     "min_volume_krw": 5000000000,
     "min_volatility": 0.5,
     "max_volatility": 20,
     "min_quality_score": 6.0,
-    "refresh_interval_hours": 1,
-    "empty_list_retry_seconds": 60,
-    "empty_list_retry_max_seconds": 600,
     "excluded_coins": []
   },
   "indicators": {

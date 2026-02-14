@@ -13,7 +13,6 @@ import readline  # 명령어 히스토리용
 # 로컬 모듈 임포트
 from logger import TradingLogger
 from trading_stats import TradingStats
-from coin_selector import CoinSelector
 from trading_engine import TradingEngine
 from telegram_notifier import TelegramNotifier
 from version import BOT_NAME, BOT_DISPLAY_NAME, BOT_VERSION
@@ -29,7 +28,6 @@ class TradingBot:
         self.logger = TradingLogger(self.config)
         self.stats = TradingStats()
         self.engine = TradingEngine(self.config, self.logger, self.stats)
-        self.coin_selector = CoinSelector(self.config, self.logger, self.engine)
         self.telegram = TelegramNotifier(self.config)
         self.bot_name = BOT_NAME
         self.bot_display_name = BOT_DISPLAY_NAME
@@ -39,7 +37,6 @@ class TradingBot:
         self.is_running = False
         self.trading_thread = None
         self.target_coins = []
-        self.last_coin_refresh = None
         self.is_trading_paused = False
         self.cooldown_until = None  # 쿨다운 종료 시간
         
@@ -58,10 +55,6 @@ class TradingBot:
         _auto = self.config['trading'].get('auto_start_on_launch', True)
         self.auto_start_on_launch = True if _auto is None else bool(_auto)
         self.check_interval = self.config['trading']['check_interval_seconds']
-        self.refresh_interval_hours = self.config['coin_selection'].get('refresh_interval_hours', 1)
-        self.empty_list_retry_seconds = self.config['coin_selection'].get('empty_list_retry_seconds', 60)
-        self.empty_list_retry_max_seconds = self.config['coin_selection'].get('empty_list_retry_max_seconds', 600)
-        self._empty_list_fail_count = 0
         self.last_buy_attempt_candle = {}  # ticker -> candle_ts
         self._last_buy_block_signature = {}  # ticker -> dedupe signature
         try:
@@ -179,11 +172,10 @@ class TradingBot:
         except Exception as e:
             self.logger.warning(f"⚠️ 초기 레짐 계산 실패: {e}")
 
-        # 코인 선정
-        self.target_coins = self.coin_selector.get_top_coins(self.max_coins)
-        self.last_coin_refresh = datetime.now()
+        # 고정 종목 목록 적용
+        self._apply_fixed_target_coins(reason="startup")
         if not self.target_coins:
-            self.logger.warning("⚠️ 거래 가능한 코인이 없습니다. 대기 상태로 시작 후 주기적으로 재조회합니다.")
+            self.logger.warning("⚠️ 고정 거래 종목이 비어 있습니다. config의 fixed_tickers를 확인하세요.")
 
         # 분석 로그: 세션 시작/초기 선정
         self.logger.log_decision(
@@ -200,7 +192,6 @@ class TradingBot:
                 "config": {
                     "max_coins": int(self.max_coins),
                     "check_interval_seconds": float(self.check_interval),
-                    "refresh_interval_hours": float(self.refresh_interval_hours),
                     "analysis_heartbeat_minutes": int(self.analysis_heartbeat_minutes),
                     "max_total_investment_krw": float(self.max_total_investment),
                     "strategy": {
@@ -257,7 +248,7 @@ class TradingBot:
         if self.target_coins:
             print("✅ 트레이딩 시작됨")
         else:
-            print("✅ 트레이딩 대기 시작됨 (거래 가능 종목 자동 탐색 중)")
+            print("✅ 트레이딩 대기 시작됨 (고정 종목 설정 확인 필요)")
     
     def _print_trading_conditions(self):
         """현재 매수 조건 출력"""
@@ -343,6 +334,58 @@ class TradingBot:
         if '-' in value:
             return value.split('-')[-1]
         return value
+
+    def _to_ticker(self, ticker_or_symbol):
+        """티커/심볼을 KRW-XXX 형태로 표준화"""
+        symbol = self._to_symbol(ticker_or_symbol)
+        return f"KRW-{symbol}" if symbol else ""
+
+    def _resolve_fixed_target_coins(self):
+        """고정 거래 종목 목록 계산(excluded_coins 제외)."""
+        coin_cfg = self.config.get("coin_selection", {}) or {}
+        strategy_cfg = self.config.get("strategy", {}) or {}
+
+        raw = coin_cfg.get("fixed_tickers", []) or strategy_cfg.get("universe", []) or ["SOL", "DOGE", "ADA"]
+        excluded = {self._to_symbol(c) for c in coin_cfg.get("excluded_coins", []) if c}
+
+        out = []
+        for item in raw:
+            ticker = self._to_ticker(item)
+            symbol = self._to_symbol(ticker)
+            if not ticker:
+                continue
+            if symbol in excluded:
+                continue
+            if ticker not in out:
+                out.append(ticker)
+
+        if self.max_coins > 0:
+            out = out[: int(self.max_coins)]
+
+        return out
+
+    def _apply_fixed_target_coins(self, reason="manual"):
+        """고정 종목 목록을 target_coins에 재적용."""
+        old = list(self.target_coins or [])
+        new = self._resolve_fixed_target_coins()
+
+        self.target_coins = list(new)
+
+        added = [c for c in new if c not in old]
+        removed = [c for c in old if c not in new]
+
+        self.logger.log_decision(
+            "COIN_REFRESH",
+            {
+                "reason": reason,
+                "mode": "fixed_tickers_only",
+                "ok": bool(new),
+                "selected": list(new),
+                "added": list(added),
+                "removed": list(removed),
+            },
+        )
+        return list(new), list(added), list(removed)
     
     def _is_protected_coin(self, ticker_or_symbol):
         """예외 종목(수동 관리) 여부 확인"""
@@ -572,7 +615,7 @@ class TradingBot:
             elif cmd == '/balance' or cmd == '/잔고':
                 self._telegram_balance()
             
-            # /refresh - 종목 갱신
+            # /refresh - 고정 종목 재적용
             elif cmd == '/refresh' or cmd == '/갱신':
                 self._telegram_refresh()
             
@@ -978,58 +1021,38 @@ class TradingBot:
         self.telegram.send_message(message)
     
     def _telegram_refresh(self):
-        """텔레그램: 종목 갱신"""
+        """텔레그램: 고정 종목 목록 재적용"""
         if not self.is_running:
             self.telegram.send_message("⚠️ 프로그램이 실행 중이 아닙니다.")
             return
-        
-        # 현재 목록
-        old_coins = set(self.target_coins)
-        
-        # 새 목록 선정
-        new_coins = self.coin_selector.get_top_coins(self.max_coins)
-        
+
+        new_coins, added, removed = self._apply_fixed_target_coins(reason="telegram_refresh")
         if not new_coins:
-            self.telegram.send_message("❌ 종목 선정 실패")
+            self.telegram.send_message("❌ 고정 종목 목록이 비어 있습니다. config를 확인하세요.")
             return
-        
-        new_coins_set = set(new_coins)
-        
-        # 변경사항
-        added = new_coins_set - old_coins
-        removed = old_coins - new_coins_set
-        kept = old_coins & new_coins_set
-        
-        # 목록 업데이트
-        self.target_coins = new_coins
-        self.last_coin_refresh = datetime.now()
-        
-        message = f"""🔄 <b>종목 갱신 완료</b>
+
+        kept = len(new_coins) - len(added)
+        message = f"""🔄 <b>고정 종목 재적용 완료</b>
 
 📊 변경사항
-유지: {len(kept)}개
+유지: {kept}개
 추가: {len(added)}개
 제외: {len(removed)}개
 """
-        
+
         if added:
-            added_names = [c.replace('KRW-', '') for c in added]
+            added_names = [c.replace('KRW-', '') for c in sorted(added)]
             message += f"\n➕ 추가: {', '.join(added_names)}"
-        
+
         if removed:
-            removed_names = []
-            for coin in removed:
-                name = coin.replace('KRW-', '')
-                if coin in self.stats.positions:
-                    removed_names.append(f"{name} 📍")
-                else:
-                    removed_names.append(name)
+            removed_names = [c.replace('KRW-', '') for c in sorted(removed)]
             message += f"\n➖ 제외: {', '.join(removed_names)}"
-        
-        message += "\n\n💡 제외된 종목의 포지션은 유지됩니다"
-        
+
+        selected_names = [c.replace('KRW-', '') for c in new_coins]
+        message += f"\n\n🎯 현재 거래 대상: {', '.join(selected_names)}"
+
         self.telegram.send_message(message)
-        self.logger.info(f"텔레그램: 종목 갱신 - 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
+        self.logger.info(f"텔레그램: 고정 종목 재적용 - 유지 {kept}, 추가 {len(added)}, 제외 {len(removed)}")
     
     def _telegram_pause(self):
         """텔레그램: 일시 정지"""
@@ -1062,7 +1085,7 @@ class TradingBot:
 /balance - 잔고 확인
 
 🎮 <b>제어</b>
-/refresh - 종목 목록 갱신
+/refresh - 고정 종목 재적용
 /pause - 일시 정지
 /resume - 거래 재개
 
@@ -1517,7 +1540,7 @@ class TradingBot:
         print("="*80 + "\n")
     
     def refresh_coins(self):
-        """종목 목록 수동 갱신 (포지션 유지)"""
+        """고정 종목 목록 수동 재적용"""
         
         if not self.is_running:
             print("⚠️  트레이딩이 실행 중이 아닙니다.")
@@ -1525,7 +1548,7 @@ class TradingBot:
             return
         
         print("\n" + "="*80)
-        print("🔄 종목 목록 갱신")
+        print("🔄 고정 종목 재적용")
         print("="*80)
         
         # 현재 목록
@@ -1535,20 +1558,16 @@ class TradingBot:
             in_position = "📍" if coin in self.stats.positions else "  "
             print(f"  {in_position} {coin.replace('KRW-', '')}")
         
-        # 새 목록 선정
-        self.logger.info("🔄 수동 종목 갱신 시작")
-        new_coins = self.coin_selector.get_top_coins(self.max_coins)
+        # 고정 목록 재적용
+        self.logger.info("🔄 수동 고정 종목 재적용 시작")
+        new_coins, added, removed = self._apply_fixed_target_coins(reason="manual_refresh")
         
         if not new_coins:
-            print("\n❌ 새로운 종목 선정 실패")
-            self.logger.warning("종목 갱신 실패")
+            print("\n❌ 고정 종목 목록이 비어 있습니다. config를 확인하세요.")
+            self.logger.warning("고정 종목 재적용 실패")
             return
         
         new_coins_set = set(new_coins)
-        
-        # 변경사항 분석
-        added = new_coins_set - old_coins
-        removed = old_coins - new_coins_set
         kept = old_coins & new_coins_set
         
         print(f"\n📊 변경 사항")
@@ -1567,18 +1586,13 @@ class TradingBot:
                 has_position = "📍 포지션 유지" if coin in self.stats.positions else ""
                 print(f"   {coin.replace('KRW-', '')} {has_position}")
         
-        # 목록 업데이트
-        self.target_coins = new_coins
-        self.last_coin_refresh = datetime.now()
-        
-        print(f"\n✅ 종목 목록 갱신 완료")
+        print(f"\n✅ 고정 종목 재적용 완료")
         print(f"\n💡 안내:")
-        print(f"   - 제외된 종목의 포지션은 유지됩니다")
-        print(f"   - 매도 신호 발생 시 정상적으로 청산됩니다")
-        print(f"   - 새로운 매수는 갱신된 목록에서만 진행됩니다")
+        print(f"   - 현재 설정의 fixed_tickers만 거래 대상으로 사용합니다")
+        print(f"   - 제외된 종목 포지션은 보유 시 매도 신호가 나올 때만 청산됩니다")
         print("="*80 + "\n")
         
-        self.logger.info(f"종목 갱신 완료: 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
+        self.logger.info(f"고정 종목 재적용 완료: 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
     
     def exit_program(self):
         """프로그램 종료"""
@@ -1744,117 +1758,6 @@ class TradingBot:
         }
         self.logger.log_decision("LOOP_HEARTBEAT", payload)
     
-    def _refresh_coin_list(self, reason="auto"):
-        """코인 목록 갱신 (기존 포지션은 유지).
-
-        - reason='hourly'면 텔레그램 알림 전송
-        - 갱신 실패 시에도 과도한 반복 시도를 방지하기 위해 시도 시각(last_coin_refresh)을 갱신합니다.
-        """
-        
-        self.logger.info("🔄 코인 목록 갱신 시작")
-        try:
-            force_regime = reason in ("hourly", "manual")
-            regime, _ = self.engine.update_global_regime(force=force_regime)
-            self.logger.info(f"🌐 종목 갱신 전 레짐 확인: {regime}")
-        except Exception as e:
-            self.logger.warning(f"⚠️ 종목 갱신 전 레짐 확인 실패: {e}")
-        
-        # 실패 시에도 다음 주기까지 대기하도록 \"시도\" 시각을 먼저 갱신
-        refresh_ts = datetime.now()
-        self.last_coin_refresh = refresh_ts
-        
-        # 새로운 코인 목록 가져오기
-        new_coins = self.coin_selector.get_top_coins(self.max_coins)
-        
-        if not new_coins:
-            current_regime = getattr(self.engine, "global_regime", "RANGE")
-            is_bear_wait = (current_regime == "BEAR")
-            if is_bear_wait:
-                self.logger.info("🛑 BEAR 레짐으로 신규 진입 대기 (기존 목록 유지)")
-            else:
-                self.logger.warning("⚠️  새로운 코인 선정 실패, 기존 목록 유지")
-
-            if reason == "empty" and not is_bear_wait:
-                self._empty_list_fail_count = int(self._empty_list_fail_count or 0) + 1
-            self.logger.log_decision(
-                "COIN_REFRESH",
-                {
-                    "reason": reason,
-                    "ok": False,
-                    "global_regime": current_regime,
-                    "bear_wait": bool(is_bear_wait),
-                    "selected": [],
-                    "fail_count_empty": int(self._empty_list_fail_count or 0),
-                },
-            )
-            if reason == "hourly":
-                if is_bear_wait:
-                    self.telegram.send_message(
-                        "⏱️ <b>1시간 자동 종목 갱신</b>\n\n"
-                        "현재 글로벌 레짐이 BEAR로 판단되어 신규 진입을 대기합니다."
-                    )
-                else:
-                    self.telegram.send_message(
-                        "⚠️ <b>1시간 자동 종목 갱신 실패</b>\n\n"
-                        "조건에 맞는 코인이 없어 기존 목록을 유지합니다."
-                    )
-            return
-        
-        # 성공 시 empty 재시도 백오프 리셋
-        self._empty_list_fail_count = 0
-        
-        old_coins = set(self.target_coins)
-        new_coins_set = set(new_coins)
-        added_coins = new_coins_set - old_coins
-        removed_coins = old_coins - new_coins_set
-        kept_coins = old_coins & new_coins_set
-        
-        if removed_coins:
-            self.logger.info(
-                f"📌 목록 제외 코인(포지션 유지): {', '.join([c.replace('KRW-', '') for c in removed_coins])}"
-            )
-        
-        # 새로운 목록으로 교체
-        self.target_coins = new_coins
-        self.last_coin_refresh = refresh_ts
-        
-        self.logger.info(f"✅ 코인 목록 갱신 완료: {', '.join([c.replace('KRW-', '') for c in new_coins])}")
-
-        self.logger.log_decision(
-            "COIN_REFRESH",
-            {
-                "reason": reason,
-                "ok": True,
-                "global_regime": getattr(self.engine, "global_regime", "RANGE"),
-                "selected": list(new_coins),
-                "kept": [c for c in sorted(kept_coins)],
-                "added": [c for c in sorted(added_coins)],
-                "removed": [c for c in sorted(removed_coins)],
-            },
-        )
-        
-        if reason == "hourly":
-            message = (
-                "⏱️ <b>1시간 자동 종목 갱신</b>\n\n"
-                f"유지: {len(kept_coins)}개\n"
-                f"추가: {len(added_coins)}개\n"
-                f"제외: {len(removed_coins)}개"
-            )
-            
-            if added_coins:
-                added_names = [c.replace('KRW-', '') for c in sorted(added_coins)]
-                message += f"\n\n➕ 추가: {', '.join(added_names)}"
-            
-            if removed_coins:
-                removed_names = [c.replace('KRW-', '') for c in sorted(removed_coins)]
-                message += f"\n➖ 제외: {', '.join(removed_names)}"
-            
-            self.telegram.send_message(message)
-            self.logger.info(
-                f"텔레그램: 1시간 자동 종목 갱신 알림 - 유지 {len(kept_coins)}, "
-                f"추가 {len(added_coins)}, 제외 {len(removed_coins)}"
-            )
-    
     def _trading_loop(self):
         """거래 루프 (별도 스레드에서 실행)"""
         
@@ -1915,9 +1818,6 @@ class TradingBot:
                     elif is_trading_time and self.is_trading_paused:
                         self.logger.info("▶️  거래 시간 시작 - 재개")
                         self.is_trading_paused = False
-                        
-                        # 코인 목록 갱신
-                        self._refresh_coin_list()
                     
                     # 일시 정지 중이면 대기
                     if self.is_trading_paused:
@@ -1939,29 +1839,14 @@ class TradingBot:
                 except Exception as e:
                     self.logger.warning(f"⚠️ 분석 heartbeat 기록 오류: {e}")
                 
-                # 코인 목록 갱신 체크 (설정된 시간마다)
-                if self.last_coin_refresh:
-                    elapsed_hours = (datetime.now() - self.last_coin_refresh).total_seconds() / 3600
-                    
-                    if elapsed_hours >= self.refresh_interval_hours:
-                        self._refresh_coin_list(reason="hourly")
-                
-                # 거래 대상이 비어있으면 짧은 주기로 재조회
+                # 거래 대상이 비어있으면 고정 종목을 재적용
                 if not self.target_coins:
-                    elapsed_sec = (datetime.now() - self.last_coin_refresh).total_seconds() if self.last_coin_refresh else 999999
-                    retry_interval = min(
-                        float(self.empty_list_retry_max_seconds or 600),
-                        float(self.empty_list_retry_seconds or 60) * (2 ** int(self._empty_list_fail_count or 0)),
-                    )
-                    if elapsed_sec >= retry_interval:
-                        self.logger.info(
-                            f"🔁 거래 가능 종목 재탐색 중... (주기 {int(retry_interval)}초, 실패 {self._empty_list_fail_count}회)"
-                        )
-                        self._refresh_coin_list(reason="empty")
+                    self.logger.warning("⚠️ 거래 대상이 비어 있어 고정 종목을 재적용합니다.")
+                    self._apply_fixed_target_coins(reason="empty_recover")
 
                     # 대상 종목도 없고 보유 포지션도 없으면 대기만 하고 루프 종료
                     if not self.stats.positions:
-                        time.sleep(min(self.check_interval, self.empty_list_retry_seconds))
+                        time.sleep(self.check_interval)
                         continue
                 
                 # 각 코인별로 매매 체크
@@ -2453,12 +2338,12 @@ def print_help():
     print("="*80)
     print("📖 사용 가능한 명령어")
     print("="*80)
-    print("  start   - 트레이딩 시작 (코인 선정 후 자동 매매 시작)")
+    print("  start   - 트레이딩 시작 (고정 종목 기준 자동 매매 시작)")
     print("  stop    - 트레이딩 정지 (모든 포지션 청산)")
     print("  status  - 현재 거래 상태 및 통계 표시")
     print("  daily   - 오늘의 거래 통계 표시")
     print("  weekly  - 최근 7일 거래 통계 표시")
-    print("  refresh - 종목 목록 갱신 (포지션은 유지)")
+    print("  refresh - 고정 종목 목록 재적용")
     print("  version - 버전 정보 표시")
     print("  help    - 도움말 표시")
     print("  exit    - 프로그램 종료")

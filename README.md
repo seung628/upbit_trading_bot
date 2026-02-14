@@ -58,7 +58,7 @@
 ## 텔레그램
 
 - 시작/매수/매도/오류/일일 요약 알림 지원
-- 명령어: `/status`, `/daily`, `/weekly`, `/positions`, `/balance`, `/refresh`, `/pause`, `/resume`, `/version`, `/help`
+- 명령어: `/status`, `/daily`, `/weekly`, `/positions`, `/balance`, `/refresh`(고정 종목 재적용), `/pause`, `/resume`, `/version`, `/help`
 
 ## 실행 방법
 
