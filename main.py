@@ -2153,6 +2153,11 @@ class TradingBot:
                                                 buy_score=signal_score,
                                                 buy_meta=buy_meta,
                                             )
+                                            self.logger.info(
+                                                f"Position open confirmation: {ticker} "
+                                                f"amount={float(buy_result.get('amount', 0) or 0):.8f} "
+                                                f"price={float(buy_result.get('price', 0) or 0):,.0f}"
+                                            )
                                             
                                             # 잔고 업데이트
                                             new_balance = self.engine.get_balance("KRW")

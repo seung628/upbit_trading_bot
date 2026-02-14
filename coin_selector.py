@@ -72,15 +72,21 @@ class CoinSelector:
             unit = units[0]
             ask_price = self._to_float(unit.get("ask_price", 0))
             bid_price = self._to_float(unit.get("bid_price", 0))
-            ask_size = self._to_float(unit.get("ask_size", 0))
-            bid_size = self._to_float(unit.get("bid_size", 0))
 
             if ask_price <= 0 or bid_price <= 0:
                 return False, {"reason": "호가가격이상"}
 
             spread_pct = ((ask_price - bid_price) / bid_price) * 100
-            ask_depth_krw = ask_price * ask_size
-            bid_depth_krw = bid_price * bid_size
+            top5 = units[:5]
+            ask_depth_krw = 0.0
+            bid_depth_krw = 0.0
+            for u in top5:
+                u_ask_price = self._to_float(u.get("ask_price", 0))
+                u_bid_price = self._to_float(u.get("bid_price", 0))
+                u_ask_size = self._to_float(u.get("ask_size", 0))
+                u_bid_size = self._to_float(u.get("bid_size", 0))
+                ask_depth_krw += u_ask_price * u_ask_size
+                bid_depth_krw += u_bid_price * u_bid_size
 
             details = {
                 "spread_pct": float(spread_pct),
@@ -93,7 +99,7 @@ class CoinSelector:
                 details["reason"] = f"스프레드과다({spread_pct:.2f}%)"
                 return False, details
             if ask_depth_krw < self.min_orderbook_depth or bid_depth_krw < self.min_orderbook_depth:
-                details["reason"] = "호가잔량부족"
+                details["reason"] = "LOW_LIQUIDITY"
                 return False, details
 
             details["reason"] = "ok"

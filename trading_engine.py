@@ -103,6 +103,9 @@ class TradingEngine:
         self._regime_changed_at = None
 
         self._ohlcv_cache = {}
+        self._last_resample_closed_ts = {}
+        self._last_log_bucket = {}
+        self._last_btc_filter_signature = None
 
         self._patch_pyupbit_remaining_req_parser()
 
@@ -112,6 +115,16 @@ class TradingEngine:
             return float(value)
         except Exception:
             return float(default)
+
+    def _throttled_info(self, key, message, bucket_seconds=60):
+        try:
+            bucket = int(time.time() // max(1, int(bucket_seconds)))
+        except Exception:
+            bucket = int(time.time())
+        if self._last_log_bucket.get(key) == bucket:
+            return
+        self._last_log_bucket[key] = bucket
+        self.logger.info(message)
 
     @staticmethod
     def _parse_risk_pct(value, default=0.004):
@@ -244,11 +257,11 @@ class TradingEngine:
             if not orderbook["orderbook_units"]:
                 return False, "호가 정보 없음", {"ticker": ticker}
 
-            units = orderbook["orderbook_units"][0]
-            ask_price = self._safe_float(units.get("ask_price", 0))
-            bid_price = self._safe_float(units.get("bid_price", 0))
-            ask_size = self._safe_float(units.get("ask_size", 0))
-            bid_size = self._safe_float(units.get("bid_size", 0))
+            top_unit = orderbook["orderbook_units"][0]
+            ask_price = self._safe_float(top_unit.get("ask_price", 0))
+            bid_price = self._safe_float(top_unit.get("bid_price", 0))
+            ask_size = self._safe_float(top_unit.get("ask_size", 0))
+            bid_size = self._safe_float(top_unit.get("bid_size", 0))
 
             details = {
                 "ticker": ticker,
@@ -266,15 +279,31 @@ class TradingEngine:
             if spread_pct > self.max_spread_pct:
                 return False, f"스프레드 과다({spread_pct:.2f}%)", details
 
-            bid_depth_krw = bid_price * bid_size
-            ask_depth_krw = ask_price * ask_size
-            details["bid_depth_krw"] = float(bid_depth_krw)
-            details["ask_depth_krw"] = float(ask_depth_krw)
+            top5 = orderbook["orderbook_units"][:5]
+            bid_depth_krw_5 = 0.0
+            ask_depth_krw_5 = 0.0
+            bid_size_sum_5 = 0.0
+            ask_size_sum_5 = 0.0
+            for unit in top5:
+                u_bid_price = self._safe_float(unit.get("bid_price", 0))
+                u_ask_price = self._safe_float(unit.get("ask_price", 0))
+                u_bid_size = self._safe_float(unit.get("bid_size", 0))
+                u_ask_size = self._safe_float(unit.get("ask_size", 0))
+                bid_depth_krw_5 += u_bid_price * u_bid_size
+                ask_depth_krw_5 += u_ask_price * u_ask_size
+                bid_size_sum_5 += u_bid_size
+                ask_size_sum_5 += u_ask_size
 
-            if bid_depth_krw < self.min_orderbook_depth:
-                return False, f"매수호가 부족({bid_depth_krw:,.0f}원)", details
-            if ask_depth_krw < self.min_orderbook_depth:
-                return False, f"매도호가 부족({ask_depth_krw:,.0f}원)", details
+            details["bid_depth_krw"] = float(bid_price * bid_size)
+            details["ask_depth_krw"] = float(ask_price * ask_size)
+            details["bid_depth_krw_5"] = float(bid_depth_krw_5)
+            details["ask_depth_krw_5"] = float(ask_depth_krw_5)
+            details["bid_size_sum_5"] = float(bid_size_sum_5)
+            details["ask_size_sum_5"] = float(ask_size_sum_5)
+
+            min_depth_krw_5 = min(bid_depth_krw_5, ask_depth_krw_5)
+            if min_depth_krw_5 < self.min_orderbook_depth:
+                return False, f"LOW_LIQUIDITY({min_depth_krw_5:,.0f}원)", details
 
             return True, "안전", details
         except Exception as e:
@@ -354,7 +383,38 @@ class TradingEngine:
             if (now - ts) < ttl_seconds and cached_df is not None:
                 return cached_df.copy()
 
-        df = pyupbit.get_ohlcv(ticker, interval=interval, count=count)
+        count_int = max(1, int(count))
+        if count_int <= 200:
+            df = pyupbit.get_ohlcv(ticker, interval=interval, count=count_int)
+        else:
+            frames = []
+            remain = count_int
+            to = None
+            while remain > 0:
+                batch = min(200, remain)
+                if to is None:
+                    part = pyupbit.get_ohlcv(ticker, interval=interval, count=batch)
+                else:
+                    part = pyupbit.get_ohlcv(ticker, interval=interval, count=batch, to=to)
+                if part is None or len(part) == 0:
+                    break
+                frames.append(part)
+                remain -= len(part)
+                first_ts = pd.Timestamp(part.index[0])
+                # pyupbit의 `to`는 UTC 문자열 해석이 가장 안정적이다.
+                to_utc = first_ts - pd.Timedelta(hours=9, seconds=1)
+                to = to_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if len(part) < batch:
+                    break
+                time.sleep(0.05)
+
+            if frames:
+                df = pd.concat(frames).sort_index()
+                df = df[~df.index.duplicated(keep="first")]
+                df = df.tail(count_int)
+            else:
+                df = None
+
         if df is not None:
             self._ohlcv_cache[key] = (now, df.copy())
         return df
@@ -394,9 +454,17 @@ class TradingEngine:
             .dropna()
         )
 
-        if len(resampled) < max(60, int(count * 0.5)):
+        if len(resampled) < 210:
             return None
-        return resampled.tail(max(count, 120))
+
+        if int(minutes) == 20 and len(resampled) >= 2:
+            last_closed = str(resampled.index[-2])
+            prev = self._last_resample_closed_ts.get(ticker)
+            if prev != last_closed:
+                self._last_resample_closed_ts[ticker] = last_closed
+                self.logger.info(f"Resampled to 20min for {ticker}, last closed candle: {last_closed}")
+
+        return resampled.tail(max(count, 210))
 
     def _is_entry_time_blocked(self):
         now_hour = datetime.now().hour
@@ -419,10 +487,11 @@ class TradingEngine:
         df = self._get_resampled_ohlcv(
             self.btc_filter_ticker,
             minutes=self.signal_candle_minutes,
-            count=max(90, self.btc_filter_ema_period + 30),
+            count=max(220, self.btc_filter_ema_period + 40),
             ttl_seconds=10,
         )
         if df is None or len(df) < self.btc_filter_ema_period + 2:
+            self._throttled_info("btc_filter_short", "BUY_BLOCKED: BTC_FILTER (btc_data_short)", bucket_seconds=60)
             return False, {"enabled": True, "reason": "btc_data_short"}
 
         work = df.copy()
@@ -431,13 +500,26 @@ class TradingEngine:
         close = self._safe_float(row.get("close", 0), 0)
         ema = self._safe_float(row.get("ema_btc", 0), 0)
         passed = close > ema > 0
-        return passed, {
+        meta = {
             "enabled": True,
             "ticker": self.btc_filter_ticker,
             "close": float(close),
             "ema": float(ema),
             "passed": bool(passed),
+            "candle_ts": str(getattr(row, "name", "") or ""),
         }
+        sig = (meta["candle_ts"], bool(passed))
+        if sig != self._last_btc_filter_signature:
+            self._last_btc_filter_signature = sig
+            if passed:
+                self.logger.info(
+                    f"BTC_FILTER PASS | close={close:,.0f} ema{self.btc_filter_ema_period}={ema:,.0f}"
+                )
+            else:
+                self.logger.info(
+                    f"BUY_BLOCKED: BTC_FILTER | close={close:,.0f} ema{self.btc_filter_ema_period}={ema:,.0f}"
+                )
+        return passed, meta
 
     def _persist_position_meta(self, ticker, position, buy_meta):
         if not isinstance(position, dict):
@@ -640,6 +722,15 @@ class TradingEngine:
             "detect": detect_meta,
         }
         self.logger.log_decision("REGIME_UPDATE", payload)
+        self._throttled_info(
+            "regime_candidate",
+            (
+                f"Regime candidate: {candidate}, "
+                f"confirm_count: {int(self._regime_candidate_count)}/{int(self.regime_confirm_count)}, "
+                f"current: {self.global_regime}"
+            ),
+            bucket_seconds=30,
+        )
         if applied:
             self.logger.info(f"📈 글로벌 레짐 전환: {previous_regime} -> {self.global_regime}")
         return self.global_regime, payload
@@ -779,12 +870,72 @@ class TradingEngine:
         return None
 
     def check_buy_signal(self, ticker):
-        """스펙 기반 매수 시그널 판단."""
+        """스펙 기반 매수 시그널 판단 (안전 실행 순서 강제)."""
         try:
+            # 1) 글로벌 레짐
             regime, _ = self.update_global_regime(force=False)
+            if regime == "BEAR":
+                self._throttled_info("buy_block_global_bear", "BUY_BLOCKED: GLOBAL_BEAR", bucket_seconds=60)
+                return False, [], None, 0, {
+                    "ticker": ticker,
+                    "global_regime": regime,
+                    "blocked_by": ["GLOBAL_BEAR"],
+                }
+
+            # 2) BTC 필터
+            btc_filter_passed, btc_filter_meta = self._check_btc_trend_filter()
+            if not btc_filter_passed:
+                self._throttled_info("buy_block_btc", "BUY_BLOCKED: BTC_FILTER", bucket_seconds=60)
+                return False, [], None, 0, {
+                    "ticker": ticker,
+                    "global_regime": regime,
+                    "btc_filter": btc_filter_meta,
+                    "blocked_by": ["BTC_FILTER"],
+                }
+
+            # 3) 시간 필터
+            if self._is_entry_time_blocked():
+                self._throttled_info("buy_block_time", "BUY_BLOCKED: TIME_BLOCK", bucket_seconds=60)
+                return False, [], None, 0, {
+                    "ticker": ticker,
+                    "global_regime": regime,
+                    "btc_filter": btc_filter_meta,
+                    "blocked_by": ["TIME_BLOCK"],
+                }
+
+            # 전략 데이터 준비
             state = self.analyze_symbol(ticker)
             if not state:
                 return False, ["데이터부족"], None, 0, {"blocked_by": ["데이터부족"]}
+            entry_price = state["close"]
+
+            # 4) 변동성 필터
+            tr_atr_ratio = float(state.get("tr_atr_ratio", 0) or 0)
+            if tr_atr_ratio > self.volatility_tr_atr_max:
+                self._throttled_info(
+                    "buy_block_volatility",
+                    f"BUY_BLOCKED: VOLATILITY_FILTER ({ticker}, tr/atr={tr_atr_ratio:.2f})",
+                    bucket_seconds=60,
+                )
+                return False, [], entry_price, 0, {
+                    "ticker": ticker,
+                    "global_regime": regime,
+                    "btc_filter": btc_filter_meta,
+                    "tr_atr_ratio": float(tr_atr_ratio),
+                    "blocked_by": ["VOLATILITY_FILTER"],
+                }
+
+            # 5) 최대 포지션 수
+            if len(self.stats.positions) >= self.max_positions:
+                self._throttled_info("buy_block_max_positions", "BUY_BLOCKED: MAX_POSITIONS", bucket_seconds=30)
+                return False, [], entry_price, 0, {
+                    "ticker": ticker,
+                    "global_regime": regime,
+                    "btc_filter": btc_filter_meta,
+                    "max_positions": int(self.max_positions),
+                    "current_positions": int(len(self.stats.positions)),
+                    "blocked_by": ["MAX_POSITIONS"],
+                }
 
             strategy = self.select_strategy(state, regime)
             signals = []
@@ -795,18 +946,6 @@ class TradingEngine:
                 if reason not in blocked_by:
                     blocked_by.append(reason)
 
-            if self._is_entry_time_blocked():
-                block("시간필터(02-06)")
-
-            btc_filter_passed, btc_filter_meta = self._check_btc_trend_filter()
-            if not btc_filter_passed:
-                block("BTC필터차단")
-
-            if state.get("tr_atr_ratio", 0) > self.volatility_tr_atr_max:
-                block("TR/ATR과열")
-            else:
-                score += 1
-
             if strategy is None:
                 block("레짐전략불일치")
             else:
@@ -814,7 +953,6 @@ class TradingEngine:
                 signals.append(f"전략:{strategy}")
                 score += 2
 
-            entry_price = state["close"]
             stop_price = None
             take_profit_price = None
             time_stop_candles = self.time_stop_candles
@@ -879,6 +1017,7 @@ class TradingEngine:
                 block("손절가산출실패")
                 stop_price = entry_price * (1.0 + min(self.stop_loss, -0.004))
 
+            # 6) 포지션 사이즈 계산
             if strategy:
                 sizing = self._size_by_risk(ticker, entry_price, stop_price or entry_price)
             else:
@@ -893,6 +1032,7 @@ class TradingEngine:
                     "total_cap_remaining_krw": 0.0,
                     "recommended_invest_krw": 0.0,
                 }
+
             min_trade = float(self.config.get("trading", {}).get("min_trade_amount", 5500))
             if strategy and sizing["recommended_invest_krw"] < min_trade:
                 block("리스크사이징최소금액미달")
@@ -912,7 +1052,7 @@ class TradingEngine:
                 "rsi": float(state["rsi"]),
                 "atr": float(state["atr"]),
                 "atr_pct": float(state["atr_pct"]),
-                "tr_atr_ratio": float(state.get("tr_atr_ratio", 0)),
+                "tr_atr_ratio": float(tr_atr_ratio),
                 "volume_ratio": float(state["volume_ratio"]),
                 "range_position": float(state["range_position"]),
                 "middle_zone": bool(state["middle_zone"]),
@@ -1123,6 +1263,10 @@ class TradingEngine:
         """매수 실행 - 지정가 우선, 부분체결 안전 처리"""
         
         try:
+            if ticker not in self.stats.positions and len(self.stats.positions) >= self.max_positions:
+                self._throttled_info("buy_block_exec_max_positions", "BUY_BLOCKED: MAX_POSITIONS", bucket_seconds=30)
+                return None
+
             current_price = pyupbit.get_current_price(ticker)
             if current_price is None:
                 return None
@@ -1131,7 +1275,10 @@ class TradingEngine:
             if self.order_type == 'limit_with_fallback':
                 # 1단계: 지정가 주문 시도
                 orderbook = pyupbit.get_orderbook(ticker)
-                if orderbook and 'orderbook_units' in orderbook:
+                if isinstance(orderbook, list) and len(orderbook) > 0:
+                    orderbook = orderbook[0]
+
+                if isinstance(orderbook, dict) and "orderbook_units" in orderbook and orderbook["orderbook_units"]:
                     bid_price = orderbook['orderbook_units'][0]['bid_price']
                     if bid_price <= 0:
                         return None
@@ -1139,13 +1286,14 @@ class TradingEngine:
                     if buy_amount <= 0:
                         return None
                     
-                    self.logger.debug(f"  {ticker} 지정가 매수 시도: {bid_price:,.0f}원")
+                    self.logger.info(f"Limit order attempt: {ticker} @ {bid_price:,.0f}")
                     
                     # 지정가 주문
                     result = self.upbit.buy_limit_order(ticker, bid_price, buy_amount)
                     
                     if result and 'uuid' in result:
                         order_uuid = result['uuid']
+                        self.logger.info("Limit order placed, waiting fill...")
                         
                         # 체결 대기
                         time.sleep(self.limit_wait_seconds)
@@ -1185,11 +1333,13 @@ class TradingEngine:
                                 remaining_value = invest_amount - executed_value
                                 
                                 # 주문 취소
-                                self.upbit.cancel_order(order_uuid)
+                                cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
                                 
                                 # 남은 금액이 최소 주문금액 이상이면 시장가로 처리
                                 if remaining_value >= self.config['trading']['min_trade_amount']:
+                                    self.logger.info("Fallback to market triggered.")
                                     self.logger.info(f"  ↪️  남은 {remaining_value:,.0f}원 시장가 처리")
                                     
                                     # 시장가로 남은 금액 매수
@@ -1238,9 +1388,13 @@ class TradingEngine:
                             
                             # 미체결 - 주문 취소 후 시장가로 폴백
                             else:
-                                self.logger.debug(f"  ⚠️  지정가 미체결, 시장가로 전환")
-                                self.upbit.cancel_order(order_uuid)
+                                self.logger.info("Fallback to market triggered.")
+                                cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
+                else:
+                    self.logger.warning(f"{ticker} orderbook parse 실패, 시장가 폴백")
+                    self.logger.info("Fallback to market triggered.")
             
             # 2단계: 시장가 주문 (폴백 또는 기본)
             result = self.upbit.buy_market_order(ticker, invest_amount)
@@ -1353,17 +1507,21 @@ class TradingEngine:
             if self.order_type == 'limit_with_fallback':
                 # 1단계: 지정가 주문 시도
                 orderbook = pyupbit.get_orderbook(ticker)
-                if orderbook and 'orderbook_units' in orderbook:
+                if isinstance(orderbook, list) and len(orderbook) > 0:
+                    orderbook = orderbook[0]
+
+                if isinstance(orderbook, dict) and "orderbook_units" in orderbook and orderbook["orderbook_units"]:
                     # 매도 1호가 (최선 매도가)
                     ask_price = orderbook['orderbook_units'][0]['ask_price']
                     
-                    self.logger.debug(f"  {ticker} 지정가 매도 시도: {ask_price:,.0f}원")
+                    self.logger.info(f"Limit order attempt: {ticker} @ {ask_price:,.0f}")
                     
                     # 지정가 주문
                     result = self.upbit.sell_limit_order(ticker, ask_price, sell_amount)
                     
                     if result and 'uuid' in result:
                         order_uuid = result['uuid']
+                        self.logger.info("Limit order placed, waiting fill...")
                         # 체결 대기
                         time.sleep(self.limit_wait_seconds)
                         
@@ -1417,7 +1575,8 @@ class TradingEngine:
                                 )
                                 
                                 # 남은 주문 취소
-                                self.upbit.cancel_order(order_uuid)
+                                cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
                                 
                                 remaining_balance = self.get_tradable_balance(ticker)
@@ -1435,6 +1594,7 @@ class TradingEngine:
                                         'remaining_amount': remaining_balance
                                     }
                                 
+                                self.logger.info("Fallback to market triggered.")
                                 self.logger.info(f"  ↪️  남은 {remaining_balance:.8f} 시장가 처리")
                                 market_result = self.upbit.sell_market_order(ticker, round(remaining_balance, 8))
                                 if market_result and 'uuid' in market_result:
@@ -1492,9 +1652,13 @@ class TradingEngine:
                                 }
                             
                             # 미체결 - 주문 취소 후 시장가로 폴백
-                            self.logger.debug(f"  ⚠️  지정가 미체결, 시장가로 전환")
-                            self.upbit.cancel_order(order_uuid)
+                            self.logger.info("Fallback to market triggered.")
+                            cancel_result = self.upbit.cancel_order(order_uuid)
+                            self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                             time.sleep(0.3)
+                else:
+                    self.logger.warning(f"{ticker} orderbook parse 실패, 시장가 폴백")
+                    self.logger.info("Fallback to market triggered.")
             
             # 2단계: 시장가 주문 (폴백 또는 기본)
             result = self.upbit.sell_market_order(ticker, sell_amount)
