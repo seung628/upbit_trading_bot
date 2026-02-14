@@ -32,6 +32,12 @@ class FakeLogger:
     def has_info(self, token):
         return any(level == "info" and token in msg for level, msg in self.records)
 
+    def has_warning(self, token):
+        return any(level == "warning" and token in msg for level, msg in self.records)
+
+    def has_error(self, token):
+        return any(level == "error" and token in msg for level, msg in self.records)
+
 
 class FakeStats:
     def __init__(self):
@@ -68,6 +74,38 @@ class DummyUpbit:
             "avg_buy_price": "0.0",
             "paid_fee": "0.0",
         }
+
+
+class DummyUpbitUnknownStatus:
+    def __init__(self, cancel_returns=None):
+        self.buy_limit_calls = []
+        self.buy_market_calls = []
+        self.cancel_calls = []
+        self.cancel_returns = list(cancel_returns or [])
+
+    def buy_limit_order(self, ticker, price, amount):
+        self.buy_limit_calls.append((ticker, float(price), float(amount)))
+        return {"uuid": "buy-uuid"}
+
+    def buy_market_order(self, ticker, amount_krw):
+        self.buy_market_calls.append((ticker, float(amount_krw)))
+        return {"uuid": "market-uuid"}
+
+    def get_order(self, uuid):
+        if uuid == "buy-uuid":
+            return None
+        return {
+            "state": "done",
+            "executed_volume": "0.0",
+            "avg_buy_price": "0.0",
+            "paid_fee": "0.0",
+        }
+
+    def cancel_order(self, uuid):
+        self.cancel_calls.append(uuid)
+        if self.cancel_returns:
+            return self.cancel_returns.pop(0)
+        return None
 
 
 def make_config(min_depth=1000):
@@ -182,6 +220,45 @@ class TradingEngineOrderbookTests(unittest.TestCase):
         self.assertFalse(buy_signal)
         self.assertIn("ENTRY_TIME_BLOCKED", meta.get("blocked_by", []))
         self.assertTrue(logger.has_info("BUY_BLOCKED: ENTRY_TIME_BLOCKED"))
+
+    def test_unknown_limit_status_fails_closed_without_market_fallback(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        engine.upbit = DummyUpbitUnknownStatus(cancel_returns=[None, None, None])
+
+        with patch("trading_engine.pyupbit.get_current_price", return_value=100.0):
+            with patch(
+                "trading_engine.pyupbit.get_orderbook",
+                return_value={"orderbook_units": [{"bid_price": 100.0, "ask_price": 101.0}]},
+            ):
+                result = engine.execute_buy("KRW-TEST", 10000)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(engine.upbit.buy_limit_calls), 1)
+        self.assertEqual(len(engine.upbit.buy_market_calls), 0)
+        self.assertGreaterEqual(len(engine.upbit.cancel_calls), 1)
+        self.assertTrue(logger.has_warning("LIMIT_ORDER_STATUS_UNKNOWN"))
+        self.assertTrue(logger.has_info("LIMIT_ORDER_TIMEOUT_CANCEL_RESULT"))
+        self.assertTrue(logger.has_error("FALLBACK_ABORTED"))
+
+    def test_unknown_limit_status_cancel_ok_still_fails_closed(self):
+        logger = FakeLogger()
+        engine = TradingEngine(make_config(), logger, FakeStats())
+        engine.upbit = DummyUpbitUnknownStatus(cancel_returns=[{"uuid": "buy-uuid", "state": "cancel"}])
+
+        with patch("trading_engine.pyupbit.get_current_price", return_value=100.0):
+            with patch(
+                "trading_engine.pyupbit.get_orderbook",
+                return_value={"orderbook_units": [{"bid_price": 100.0, "ask_price": 101.0}]},
+            ):
+                result = engine.execute_buy("KRW-TEST", 10000)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(engine.upbit.buy_limit_calls), 1)
+        self.assertEqual(len(engine.upbit.buy_market_calls), 0)
+        self.assertTrue(logger.has_warning("LIMIT_ORDER_STATUS_UNKNOWN"))
+        self.assertTrue(logger.has_info("LIMIT_ORDER_TIMEOUT_CANCEL_RESULT"))
+        self.assertTrue(logger.has_error("FALLBACK_ABORTED"))
 
 
 if __name__ == "__main__":

@@ -126,6 +126,43 @@ class TradingEngine:
         self._last_log_bucket[key] = bucket
         self.logger.info(message)
 
+    def _safe_get_order(self, uuid):
+        """주문 조회 실패 시 None 반환 (예외를 상위 매수 플로우로 전파하지 않음)."""
+        try:
+            if self.upbit is None:
+                return None
+            return self.upbit.get_order(uuid)
+        except Exception as e:
+            self.logger.warning(f"GET_ORDER_ERROR uuid={uuid} err={type(e).__name__}: {e}")
+            return None
+
+    def _try_cancel_limit(self, uuid, side="BUY", ticker="", retries=3):
+        """지정가 취소 재시도. 취소 확인 전에는 시장가 폴백 금지."""
+        for attempt in range(1, int(retries) + 1):
+            try:
+                if self.upbit is None:
+                    self.logger.warning(
+                        f"CANCEL_ORDER_ERROR | side={side} ticker={ticker} "
+                        f"uuid={uuid} try={attempt}/{retries} err=upbit_none"
+                    )
+                    time.sleep(0.2)
+                    continue
+                result = self.upbit.cancel_order(uuid)
+                ok = result is not None
+                self.logger.info(
+                    f"LIMIT_ORDER_CANCEL_RESULT | side={side} ticker={ticker} "
+                    f"uuid={uuid} ok={ok} try={attempt}/{retries}"
+                )
+                if ok:
+                    return True
+            except Exception as e:
+                self.logger.warning(
+                    f"CANCEL_ORDER_ERROR | side={side} ticker={ticker} "
+                    f"uuid={uuid} try={attempt}/{retries} err={type(e).__name__}: {e}"
+                )
+            time.sleep(0.2)
+        return False
+
     @staticmethod
     def _parse_risk_pct(value, default=0.004):
         try:
@@ -1314,8 +1351,29 @@ class TradingEngine:
                         time.sleep(self.limit_wait_seconds)
                         
                         # 체결 확인
-                        order_info = self.upbit.get_order(order_uuid)
-                        
+                        order_info = self._safe_get_order(order_uuid)
+                        if order_info is None:
+                            self.logger.warning(
+                                f"LIMIT_ORDER_STATUS_UNKNOWN | side=BUY ticker={ticker} "
+                                f"uuid={order_uuid} action=cancel_before_fallback"
+                            )
+                            cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
+                            self.logger.info(
+                                f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                f"uuid={order_uuid} ok={cancel_ok} reason=status_unknown"
+                            )
+                            if not cancel_ok:
+                                self.logger.error(
+                                    f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} reason=cancel_failed_status_unknown"
+                                )
+                            else:
+                                self.logger.error(
+                                    f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} reason=status_unknown_fail_closed"
+                                )
+                            return None
+
                         if order_info:
                             executed_volume = float(order_info.get('executed_volume', 0))
                             
@@ -1347,13 +1405,19 @@ class TradingEngine:
                                 executed_value = executed_volume * bid_price
                                 remaining_value = invest_amount - executed_value
                                 
-                                # 주문 취소
-                                cancel_result = self.upbit.cancel_order(order_uuid)
+                                # 주문 취소 확인 전에는 시장가 폴백 금지
+                                cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
                                 self.logger.info(
-                                    f"LIMIT_ORDER_CANCEL_RESULT | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} cancelled={bool(cancel_result)}"
+                                    f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} ok={cancel_ok} reason=partial_fill"
                                 )
-                                self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
+                                if not cancel_ok:
+                                    self.logger.error(
+                                        f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} reason=cancel_failed_partial_fill"
+                                    )
+                                    return None
+                                self.logger.info(f"Cancel confirmation: {cancel_ok}")
                                 time.sleep(0.3)
                                 
                                 # 남은 금액이 최소 주문금액 이상이면 시장가로 처리
@@ -1369,7 +1433,7 @@ class TradingEngine:
                                     market_result = self.upbit.buy_market_order(ticker, remaining_value)
                                     if market_result and 'uuid' in market_result:
                                         time.sleep(0.5)
-                                        market_order = self.upbit.get_order(market_result['uuid'])
+                                        market_order = self._safe_get_order(market_result['uuid'])
                                         
                                         if market_order:
                                             market_volume = float(market_order.get('executed_volume', 0))
@@ -1411,17 +1475,23 @@ class TradingEngine:
                             
                             # 미체결 - 주문 취소 후 시장가로 폴백
                             else:
+                                cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
+                                self.logger.info(
+                                    f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} ok={cancel_ok} reason=not_filled"
+                                )
+                                if not cancel_ok:
+                                    self.logger.error(
+                                        f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} reason=cancel_failed_not_filled"
+                                    )
+                                    return None
                                 self.logger.info(
                                     f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
                                     f"uuid={order_uuid} reason=not_filled"
                                 )
                                 self.logger.info("Fallback to market triggered.")
-                                cancel_result = self.upbit.cancel_order(order_uuid)
-                                self.logger.info(
-                                    f"LIMIT_ORDER_CANCEL_RESULT | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} cancelled={bool(cancel_result)}"
-                                )
-                                self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
+                                self.logger.info(f"Cancel confirmation: {cancel_ok}")
                                 time.sleep(0.3)
                 else:
                     self.logger.warning(f"LIMIT_ORDERBOOK_PARSE_FAIL | side=BUY ticker={ticker}")
@@ -1443,7 +1513,7 @@ class TradingEngine:
             
             # UUID로 정확한 체결 정보 확인
             if 'uuid' in result:
-                order_info = self.upbit.get_order(result['uuid'])
+                order_info = self._safe_get_order(result['uuid'])
                 if order_info:
                     executed_volume = float(order_info.get('executed_volume', 0))
                     avg_price = float(order_info.get('avg_buy_price', 0))
