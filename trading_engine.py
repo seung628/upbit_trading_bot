@@ -303,6 +303,15 @@ class TradingEngine:
 
             min_depth_krw_5 = min(bid_depth_krw_5, ask_depth_krw_5)
             if min_depth_krw_5 < self.min_orderbook_depth:
+                self._throttled_info(
+                    f"buy_block_low_liquidity:{ticker}",
+                    (
+                        f"BUY_BLOCKED: LOW_LIQUIDITY | ticker={ticker} "
+                        f"depth_min_krw={min_depth_krw_5:,.0f} "
+                        f"threshold={self.min_orderbook_depth:,.0f}"
+                    ),
+                    bucket_seconds=30,
+                )
                 return False, f"LOW_LIQUIDITY({min_depth_krw_5:,.0f}원)", details
 
             return True, "안전", details
@@ -895,12 +904,12 @@ class TradingEngine:
 
             # 3) 시간 필터
             if self._is_entry_time_blocked():
-                self._throttled_info("buy_block_time", "BUY_BLOCKED: TIME_BLOCK", bucket_seconds=60)
+                self._throttled_info("buy_block_time", "BUY_BLOCKED: ENTRY_TIME_BLOCKED", bucket_seconds=60)
                 return False, [], None, 0, {
                     "ticker": ticker,
                     "global_regime": regime,
                     "btc_filter": btc_filter_meta,
-                    "blocked_by": ["TIME_BLOCK"],
+                    "blocked_by": ["ENTRY_TIME_BLOCKED"],
                 }
 
             # 전략 데이터 준비
@@ -1286,13 +1295,19 @@ class TradingEngine:
                     if buy_amount <= 0:
                         return None
                     
-                    self.logger.info(f"Limit order attempt: {ticker} @ {bid_price:,.0f}")
+                    self.logger.info(
+                        f"LIMIT_ORDER_ATTEMPT | side=BUY ticker={ticker} price={bid_price:,.0f} qty={buy_amount:.8f}"
+                    )
                     
                     # 지정가 주문
                     result = self.upbit.buy_limit_order(ticker, bid_price, buy_amount)
                     
                     if result and 'uuid' in result:
                         order_uuid = result['uuid']
+                        self.logger.info(
+                            f"LIMIT_ORDER_PLACED | side=BUY ticker={ticker} "
+                            f"uuid={order_uuid} price={bid_price:,.0f} qty={buy_amount:.8f}"
+                        )
                         self.logger.info("Limit order placed, waiting fill...")
                         
                         # 체결 대기
@@ -1334,11 +1349,19 @@ class TradingEngine:
                                 
                                 # 주문 취소
                                 cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(
+                                    f"LIMIT_ORDER_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} cancelled={bool(cancel_result)}"
+                                )
                                 self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
                                 
                                 # 남은 금액이 최소 주문금액 이상이면 시장가로 처리
                                 if remaining_value >= self.config['trading']['min_trade_amount']:
+                                    self.logger.info(
+                                        f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} reason=partial_fill remaining_krw={remaining_value:,.0f}"
+                                    )
                                     self.logger.info("Fallback to market triggered.")
                                     self.logger.info(f"  ↪️  남은 {remaining_value:,.0f}원 시장가 처리")
                                     
@@ -1388,12 +1411,25 @@ class TradingEngine:
                             
                             # 미체결 - 주문 취소 후 시장가로 폴백
                             else:
+                                self.logger.info(
+                                    f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} reason=not_filled"
+                                )
                                 self.logger.info("Fallback to market triggered.")
                                 cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(
+                                    f"LIMIT_ORDER_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} cancelled={bool(cancel_result)}"
+                                )
                                 self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
                 else:
+                    self.logger.warning(f"LIMIT_ORDERBOOK_PARSE_FAIL | side=BUY ticker={ticker}")
                     self.logger.warning(f"{ticker} orderbook parse 실패, 시장가 폴백")
+                    self.logger.info(
+                        f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
+                        "uuid=none reason=orderbook_parse_fail"
+                    )
                     self.logger.info("Fallback to market triggered.")
             
             # 2단계: 시장가 주문 (폴백 또는 기본)
@@ -1514,13 +1550,19 @@ class TradingEngine:
                     # 매도 1호가 (최선 매도가)
                     ask_price = orderbook['orderbook_units'][0]['ask_price']
                     
-                    self.logger.info(f"Limit order attempt: {ticker} @ {ask_price:,.0f}")
+                    self.logger.info(
+                        f"LIMIT_ORDER_ATTEMPT | side=SELL ticker={ticker} price={ask_price:,.0f} qty={sell_amount:.8f}"
+                    )
                     
                     # 지정가 주문
                     result = self.upbit.sell_limit_order(ticker, ask_price, sell_amount)
                     
                     if result and 'uuid' in result:
                         order_uuid = result['uuid']
+                        self.logger.info(
+                            f"LIMIT_ORDER_PLACED | side=SELL ticker={ticker} "
+                            f"uuid={order_uuid} price={ask_price:,.0f} qty={sell_amount:.8f}"
+                        )
                         self.logger.info("Limit order placed, waiting fill...")
                         # 체결 대기
                         time.sleep(self.limit_wait_seconds)
@@ -1576,6 +1618,10 @@ class TradingEngine:
                                 
                                 # 남은 주문 취소
                                 cancel_result = self.upbit.cancel_order(order_uuid)
+                                self.logger.info(
+                                    f"LIMIT_ORDER_CANCEL_RESULT | side=SELL ticker={ticker} "
+                                    f"uuid={order_uuid} cancelled={bool(cancel_result)}"
+                                )
                                 self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                                 time.sleep(0.3)
                                 
@@ -1594,6 +1640,10 @@ class TradingEngine:
                                         'remaining_amount': remaining_balance
                                     }
                                 
+                                self.logger.info(
+                                    f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=SELL ticker={ticker} "
+                                    f"uuid={order_uuid} reason=partial_fill remaining_qty={remaining_balance:.8f}"
+                                )
                                 self.logger.info("Fallback to market triggered.")
                                 self.logger.info(f"  ↪️  남은 {remaining_balance:.8f} 시장가 처리")
                                 market_result = self.upbit.sell_market_order(ticker, round(remaining_balance, 8))
@@ -1652,12 +1702,25 @@ class TradingEngine:
                                 }
                             
                             # 미체결 - 주문 취소 후 시장가로 폴백
+                            self.logger.info(
+                                f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=SELL ticker={ticker} "
+                                f"uuid={order_uuid} reason=not_filled"
+                            )
                             self.logger.info("Fallback to market triggered.")
                             cancel_result = self.upbit.cancel_order(order_uuid)
+                            self.logger.info(
+                                f"LIMIT_ORDER_CANCEL_RESULT | side=SELL ticker={ticker} "
+                                f"uuid={order_uuid} cancelled={bool(cancel_result)}"
+                            )
                             self.logger.info(f"Cancel confirmation: {bool(cancel_result)}")
                             time.sleep(0.3)
                 else:
+                    self.logger.warning(f"LIMIT_ORDERBOOK_PARSE_FAIL | side=SELL ticker={ticker}")
                     self.logger.warning(f"{ticker} orderbook parse 실패, 시장가 폴백")
+                    self.logger.info(
+                        f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=SELL ticker={ticker} "
+                        "uuid=none reason=orderbook_parse_fail"
+                    )
                     self.logger.info("Fallback to market triggered.")
             
             # 2단계: 시장가 주문 (폴백 또는 기본)
