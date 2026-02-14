@@ -58,7 +58,8 @@
 ## 텔레그램
 
 - 시작/매수/매도/오류/일일 요약 알림 지원
-- 명령어: `/status`, `/daily`, `/weekly`, `/positions`, `/balance`, `/refresh`(고정 종목 재적용), `/pause`, `/resume`, `/version`, `/help`
+- 레짐 전환 시 시장 상황 변경 알림 지원 (`telegram.notify_market_change`)
+- 명령어: `/status`, `/daily`, `/weekly`, `/positions`, `/balance`, `/pause`, `/resume`, `/version`, `/help`
 
 ## 실행 방법
 

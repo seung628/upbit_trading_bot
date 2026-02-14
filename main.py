@@ -235,15 +235,19 @@ class TradingBot:
         self.trading_thread = threading.Thread(target=self._trading_loop, daemon=True)
         self.trading_thread.start()
         
+        # 시작 시점 시장 상황 스냅샷
+        market_snapshot = self._get_market_snapshot(probe=True)
+
         # 매수 조건 출력
-        self._print_trading_conditions()
+        self._print_trading_conditions(market_snapshot=market_snapshot)
         
         # 텔레그램 알림
         self.telegram.notify_start(
             bot_name=self.bot_name,
             bot_version=self.bot_version,
             display_name=self.bot_display_name,
-            selected_coins=self.target_coins
+            selected_coins=self.target_coins,
+            market_summary_lines=self._format_market_snapshot_lines(market_snapshot),
         )
         
         # 텔레그램 명령어 수신 시작
@@ -256,7 +260,7 @@ class TradingBot:
         else:
             print("✅ 트레이딩 대기 시작됨 (고정 종목 설정 확인 필요)")
     
-    def _print_trading_conditions(self):
+    def _print_trading_conditions(self, market_snapshot=None):
         """현재 매수 조건 출력"""
 
         print("\n" + "="*80)
@@ -278,11 +282,19 @@ class TradingBot:
         btc_filter = strategy_cfg.get("btc_filter", {}) or {}
         risk_per_symbol = strategy_cfg.get("risk_per_symbol_pct", {}) or risk_cfg.get("risk_per_symbol_pct", {}) or {}
 
+        if market_snapshot is None:
+            market_snapshot = self._get_market_snapshot(probe=True)
+        market_lines = self._format_market_snapshot_lines(market_snapshot)
+
         print("\n🎯 전략 모드")
         print(f"  {mode} (레짐이 전략을 결정)")
         print(f"  현재 레짐: {getattr(self.engine, 'global_regime', 'RANGE')}")
         print(f"  레짐 갱신 주기: {regime_check_minutes}분 | 기준 봉: {signal_candle_minutes}분")
         print(f"  전환 확정: {regime_confirm_count}회 연속 (최소 유지 {regime_min_hold_minutes}분)")
+
+        print("\n🌐 현재 시장 상황")
+        for line in market_lines:
+            print(f"  {line}")
 
         print("\n📌 레짐별 전략")
         print("  SOL: BULL 레짐에서 48봉 돌파+리테스트")
@@ -345,6 +357,82 @@ class TradingBot:
         """티커/심볼을 KRW-XXX 형태로 표준화"""
         symbol = self._to_symbol(ticker_or_symbol)
         return f"KRW-{symbol}" if symbol else ""
+
+    def _regime_label(self, regime):
+        value = str(regime or "").upper()
+        labels = {
+            "BULL": "상승장(BULL)",
+            "BEAR": "하락장(BEAR)",
+            "RANGE": "횡보장(RANGE)",
+        }
+        return labels.get(value, value or "UNKNOWN")
+
+    def _get_market_snapshot(self, probe=True):
+        """현재 시장 상황(레짐/기준지표) 스냅샷."""
+        snapshot = {
+            "global_regime": str(getattr(self.engine, "global_regime", "RANGE") or "RANGE"),
+            "candidate": "",
+            "reference_ticker": str(getattr(self.engine, "regime_reference_ticker", "KRW-BTC") or "KRW-BTC"),
+            "close": None,
+            "ema50": None,
+            "ema200": None,
+            "candle_ts": "",
+            "error": "",
+        }
+
+        if not probe:
+            return snapshot
+
+        try:
+            candidate, detect_meta = self.engine.detect_global_regime()
+            snapshot["candidate"] = str(candidate or "")
+            if isinstance(detect_meta, dict):
+                snapshot["reference_ticker"] = str(
+                    detect_meta.get("reference_ticker") or snapshot["reference_ticker"]
+                )
+                snapshot["close"] = detect_meta.get("close")
+                snapshot["ema50"] = detect_meta.get("ema50")
+                snapshot["ema200"] = detect_meta.get("ema200")
+                snapshot["candle_ts"] = str(detect_meta.get("candle_ts") or "")
+                if not snapshot["candidate"]:
+                    snapshot["candidate"] = str(detect_meta.get("candidate") or "")
+        except Exception as e:
+            snapshot["error"] = str(e).replace("<", "(").replace(">", ")")
+
+        return snapshot
+
+    def _format_market_snapshot_lines(self, snapshot):
+        """시장 상황 텍스트 라인 목록 생성."""
+        data = snapshot if isinstance(snapshot, dict) else {}
+        current = str(data.get("global_regime", "RANGE") or "RANGE").upper()
+        candidate = str(data.get("candidate", "") or "").upper()
+        ref = str(data.get("reference_ticker", "KRW-BTC") or "KRW-BTC")
+
+        lines = [f"현재 레짐: {self._regime_label(current)}"]
+        if candidate and candidate != current:
+            lines.append(f"탐지 후보: {self._regime_label(candidate)}")
+        lines.append(f"기준 자산: {ref}")
+
+        close = data.get("close")
+        ema50 = data.get("ema50")
+        ema200 = data.get("ema200")
+        try:
+            if close is not None and ema50 is not None and ema200 is not None:
+                lines.append(
+                    f"종가/EMA50/EMA200: {float(close):,.0f} / {float(ema50):,.0f} / {float(ema200):,.0f}"
+                )
+        except Exception:
+            pass
+
+        candle_ts = str(data.get("candle_ts", "") or "")
+        if candle_ts:
+            lines.append(f"기준 캔들: {candle_ts}")
+
+        error = str(data.get("error", "") or "")
+        if error:
+            lines.append(f"조회 상태: {error}")
+
+        return lines
 
     def _resolve_fixed_target_coins(self):
         """고정 거래 종목 목록 계산(excluded_coins 제외)."""
@@ -621,10 +709,6 @@ class TradingBot:
             elif cmd == '/balance' or cmd == '/잔고':
                 self._telegram_balance()
             
-            # /refresh - 고정 종목 재적용
-            elif cmd == '/refresh' or cmd == '/갱신':
-                self._telegram_refresh()
-            
             # /pause - 일시 정지
             elif cmd == '/pause' or cmd == '/정지':
                 self._telegram_pause()
@@ -653,6 +737,9 @@ class TradingBot:
     def _telegram_status(self):
         """텔레그램: 상태 확인"""
         status = self.stats.get_current_status()
+        market_snapshot = self._get_market_snapshot(probe=True)
+        market_lines = self._format_market_snapshot_lines(market_snapshot)
+        market_block = "\n".join(market_lines)
         
         # 사용 가능 금액 계산
         invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
@@ -673,6 +760,9 @@ class TradingBot:
         message = f"""📊 <b>현재 상태</b>
 
 🔄 상태: {state}
+
+🌐 <b>시장 상황</b>
+{market_block}
 
 💰 <b>자금 현황</b>
 초기: {status['initial_balance']:,.0f}원
@@ -1026,40 +1116,6 @@ class TradingBot:
         
         self.telegram.send_message(message)
     
-    def _telegram_refresh(self):
-        """텔레그램: 고정 종목 목록 재적용"""
-        if not self.is_running:
-            self.telegram.send_message("⚠️ 프로그램이 실행 중이 아닙니다.")
-            return
-
-        new_coins, added, removed = self._apply_fixed_target_coins(reason="telegram_refresh")
-        if not new_coins:
-            self.telegram.send_message("❌ 고정 종목 목록이 비어 있습니다. config를 확인하세요.")
-            return
-
-        kept = len(new_coins) - len(added)
-        message = f"""🔄 <b>고정 종목 재적용 완료</b>
-
-📊 변경사항
-유지: {kept}개
-추가: {len(added)}개
-제외: {len(removed)}개
-"""
-
-        if added:
-            added_names = [c.replace('KRW-', '') for c in sorted(added)]
-            message += f"\n➕ 추가: {', '.join(added_names)}"
-
-        if removed:
-            removed_names = [c.replace('KRW-', '') for c in sorted(removed)]
-            message += f"\n➖ 제외: {', '.join(removed_names)}"
-
-        selected_names = [c.replace('KRW-', '') for c in new_coins]
-        message += f"\n\n🎯 현재 거래 대상: {', '.join(selected_names)}"
-
-        self.telegram.send_message(message)
-        self.logger.info(f"텔레그램: 고정 종목 재적용 - 유지 {kept}, 추가 {len(added)}, 제외 {len(removed)}")
-    
     def _telegram_pause(self):
         """텔레그램: 일시 정지"""
         if not self.is_running:
@@ -1091,7 +1147,6 @@ class TradingBot:
 /balance - 잔고 확인
 
 🎮 <b>제어</b>
-/refresh - 고정 종목 재적용
 /pause - 일시 정지
 /resume - 거래 재개
 
@@ -1116,6 +1171,8 @@ class TradingBot:
         """현재 상태 표시"""
         
         status = self.stats.get_current_status()
+        market_snapshot = self._get_market_snapshot(probe=True)
+        market_lines = self._format_market_snapshot_lines(market_snapshot)
         
         print("\n" + "="*80)
         print("📊 현재 거래 상태")
@@ -1125,6 +1182,10 @@ class TradingBot:
             print("⏸️  상태: 정지")
         else:
             print("▶️  상태: 실행 중")
+
+        print("\n🌐 시장 상황")
+        for line in market_lines:
+            print(f"  {line}")
         
         print(f"\n💰 자금 현황")
         print(f"  초기 자금: {status['initial_balance']:,.0f}원")
@@ -1545,61 +1606,6 @@ class TradingBot:
 
         print("="*80 + "\n")
     
-    def refresh_coins(self):
-        """고정 종목 목록 수동 재적용"""
-        
-        if not self.is_running:
-            print("⚠️  트레이딩이 실행 중이 아닙니다.")
-            print("   'start' 명령어로 먼저 시작하세요.")
-            return
-        
-        print("\n" + "="*80)
-        print("🔄 고정 종목 재적용")
-        print("="*80)
-        
-        # 현재 목록
-        old_coins = set(self.target_coins)
-        print(f"\n📋 현재 목록 ({len(old_coins)}개)")
-        for coin in old_coins:
-            in_position = "📍" if coin in self.stats.positions else "  "
-            print(f"  {in_position} {coin.replace('KRW-', '')}")
-        
-        # 고정 목록 재적용
-        self.logger.info("🔄 수동 고정 종목 재적용 시작")
-        new_coins, added, removed = self._apply_fixed_target_coins(reason="manual_refresh")
-        
-        if not new_coins:
-            print("\n❌ 고정 종목 목록이 비어 있습니다. config를 확인하세요.")
-            self.logger.warning("고정 종목 재적용 실패")
-            return
-        
-        new_coins_set = set(new_coins)
-        kept = old_coins & new_coins_set
-        
-        print(f"\n📊 변경 사항")
-        print(f"  유지: {len(kept)}개")
-        print(f"  추가: {len(added)}개")
-        print(f"  제외: {len(removed)}개")
-        
-        if added:
-            print(f"\n➕ 추가된 종목")
-            for coin in added:
-                print(f"   {coin.replace('KRW-', '')}")
-        
-        if removed:
-            print(f"\n➖ 제외된 종목")
-            for coin in removed:
-                has_position = "📍 포지션 유지" if coin in self.stats.positions else ""
-                print(f"   {coin.replace('KRW-', '')} {has_position}")
-        
-        print(f"\n✅ 고정 종목 재적용 완료")
-        print(f"\n💡 안내:")
-        print(f"   - 현재 설정의 fixed_tickers만 거래 대상으로 사용합니다")
-        print(f"   - 제외된 종목 포지션은 보유 시 매도 신호가 나올 때만 청산됩니다")
-        print("="*80 + "\n")
-        
-        self.logger.info(f"고정 종목 재적용 완료: 유지 {len(kept)}, 추가 {len(added)}, 제외 {len(removed)}")
-    
     def exit_program(self):
         """프로그램 종료"""
         
@@ -1832,7 +1838,24 @@ class TradingBot:
 
                 # 글로벌 레짐 주기 갱신
                 try:
-                    self.engine.update_global_regime(force=False)
+                    _, regime_payload = self.engine.update_global_regime(force=False)
+
+                    # 레짐 전환이 실제 확정된 경우에만 시장 변화 알림 전송
+                    if isinstance(regime_payload, dict):
+                        applied = bool(regime_payload.get("applied", False))
+                        prev_regime = str(regime_payload.get("previous", ""))
+                        curr_regime = str(regime_payload.get("current", ""))
+                        if applied and prev_regime and curr_regime and prev_regime != curr_regime:
+                            sent = self.telegram.notify_market_change(
+                                previous_regime=prev_regime,
+                                current_regime=curr_regime,
+                                detect_meta=regime_payload.get("detect", {}) or {},
+                                confirm_count=regime_payload.get("confirm_count"),
+                            )
+                            if sent:
+                                self.logger.info(
+                                    f"텔레그램: 시장 상황 변경 알림 전송 ({prev_regime} -> {curr_regime})"
+                                )
                 except Exception as e:
                     self.logger.warning(f"⚠️ 레짐 갱신 오류: {e}")
 
@@ -2296,6 +2319,24 @@ class TradingBot:
                                     
                                     # 스냅샷 즉시 업데이트 (중요!)
                                     self.stats.save_positions()
+
+                                    # 분할 매도도 텔레그램 알림 전송
+                                    holding_time = (datetime.now() - position['timestamp']).total_seconds()
+                                    partial_reason = (
+                                        f"{reason} | 부분청산 {sell_ratio*100:.0f}% "
+                                        f"(잔여 {position['amount']:.8f})"
+                                    )
+                                    success = self.telegram.notify_sell(
+                                        ticker,
+                                        position['buy_price'],
+                                        sell_result['price'],
+                                        profit_rate,
+                                        profit_krw,
+                                        holding_time,
+                                        partial_reason
+                                    )
+                                    if not success:
+                                        self.logger.debug(f"  ⚠️  {ticker} 분할 매도 텔레그램 알림 전송 실패")
                                     
                                     self.logger.info(
                                         f"  ✅ 분할 매도: {sell_ratio*100:.0f}% | "
@@ -2313,6 +2354,7 @@ class TradingBot:
                                         if final_sell:
                                             self.stats.add_fee(final_sell.get('fee', 0))
                                             final_profit = final_sell['total_krw'] - (position['buy_price'] * position['amount'])
+                                            holding_time = (datetime.now() - position['timestamp']).total_seconds()
                                             self.stats.remove_position(
                                                 ticker,
                                                 final_sell['price'],
@@ -2321,6 +2363,20 @@ class TradingBot:
                                                 sell_fee_krw=final_sell.get('fee', 0),
                                                 sell_meta={"note": "소액청산"},
                                             )
+
+                                            success = self.telegram.notify_sell(
+                                                ticker,
+                                                position['buy_price'],
+                                                final_sell['price'],
+                                                ((final_sell['price'] - position['buy_price']) / position['buy_price']) * 100
+                                                if position['buy_price'] > 0
+                                                else 0.0,
+                                                final_profit,
+                                                holding_time,
+                                                "소액청산(잔여 정리)"
+                                            )
+                                            if not success:
+                                                self.logger.debug(f"  ⚠️  {ticker} 소액청산 텔레그램 알림 전송 실패")
                                             
                                             self.logger.info(
                                                 f"  ✅ 소액청산 완료: {ticker} | "
@@ -2349,7 +2405,6 @@ def print_help():
     print("  status  - 현재 거래 상태 및 통계 표시")
     print("  daily   - 오늘의 거래 통계 표시")
     print("  weekly  - 최근 7일 거래 통계 표시")
-    print("  refresh - 고정 종목 목록 재적용")
     print("  version - 버전 정보 표시")
     print("  help    - 도움말 표시")
     print("  exit    - 프로그램 종료")
@@ -2417,9 +2472,6 @@ def main():
 
             elif command == 'weekly':
                 bot.weekly_stats()
-            
-            elif command == 'refresh':
-                bot.refresh_coins()
             
             elif command == 'version':
                 print(f"ℹ️ {BOT_NAME} v{BOT_VERSION}")

@@ -28,6 +28,7 @@ class TelegramNotifier:
         self.notify_sell_enabled = True
         self.notify_error_enabled = True
         self.notify_daily_enabled = True
+        self.notify_market_enabled = True
         
         # enabled=true인 경우 필수 정보 검증
         if self.enabled:
@@ -71,6 +72,7 @@ class TelegramNotifier:
                 self.notify_sell_enabled = self.config.get('notify_sell', True)
                 self.notify_error_enabled = self.config.get('notify_error', True)
                 self.notify_daily_enabled = self.config.get('notify_daily_summary', True)
+                self.notify_market_enabled = self.config.get('notify_market_change', True)
                 self.silent_mode = self.config.get('silent_mode', False)
                 
                 # 명령어 처리
@@ -171,7 +173,8 @@ class TelegramNotifier:
         bot_name=BOT_NAME,
         bot_version=BOT_VERSION,
         display_name=BOT_DISPLAY_NAME,
-        selected_coins=None
+        selected_coins=None,
+        market_summary_lines=None,
     ):
         """거래 시작 알림"""
         if not self.enabled:
@@ -184,12 +187,19 @@ class TelegramNotifier:
         else:
             selected_text = "없음 (자동 재탐색 중)"
 
+        market_lines = market_summary_lines if isinstance(market_summary_lines, list) else []
+        market_lines = [str(line) for line in market_lines if line]
+        market_block = ""
+        if market_lines:
+            market_block = "\n🌐 시장 상황:\n" + "\n".join(market_lines)
+
         message = f"""🚀 <b>거래 시작</b>
 
 봇: {title}
 버전: v{bot_version}
 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 초기 선정 종목: {selected_text}
+{market_block}
 
 {bot_name}이 자동 매매를 시작합니다.
 """
@@ -354,9 +364,58 @@ class TelegramNotifier:
 사유: {reason}
 재개: {minutes}분 후
 
-🕐 {datetime.now().strftime('%H:%M:%S')}
+        🕐 {datetime.now().strftime('%H:%M:%S')}
 """
         self.send_message(message)
+
+    def _regime_label(self, regime):
+        value = str(regime or "").upper()
+        labels = {
+            "BULL": "상승장(BULL)",
+            "BEAR": "하락장(BEAR)",
+            "RANGE": "횡보장(RANGE)",
+        }
+        return labels.get(value, value or "UNKNOWN")
+
+    def notify_market_change(self, previous_regime, current_regime, detect_meta=None, confirm_count=None):
+        """시장 국면(레짐) 변경 알림"""
+        if not self.enabled or not self.notify_market_enabled:
+            return False
+
+        prev = self._regime_label(previous_regime)
+        curr = self._regime_label(current_regime)
+        meta = detect_meta if isinstance(detect_meta, dict) else {}
+
+        ref = meta.get("reference_ticker", "KRW-BTC")
+        close = meta.get("close")
+        ema50 = meta.get("ema50")
+        ema200 = meta.get("ema200")
+
+        market_line = f"기준: {ref}"
+        try:
+            if close is not None and ema50 is not None and ema200 is not None:
+                market_line = (
+                    f"기준: {ref}\n"
+                    f"종가: {float(close):,.0f} | EMA50: {float(ema50):,.0f} | EMA200: {float(ema200):,.0f}"
+                )
+        except Exception:
+            pass
+
+        confirm_text = ""
+        if confirm_count is not None:
+            try:
+                confirm_text = f"\n전환 확정 조건: {int(confirm_count)}회 연속 확인"
+            except Exception:
+                confirm_text = ""
+
+        message = (
+            "🌐 <b>시장 상황 변경</b>\n\n"
+            f"{prev} ➜ {curr}\n"
+            f"{market_line}"
+            f"{confirm_text}\n\n"
+            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return self.send_message(message)
     
     def test_connection(self):
         """연결 테스트"""

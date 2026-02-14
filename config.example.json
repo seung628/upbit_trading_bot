@@ -127,6 +127,7 @@
     "notify_sell": true,
     "notify_error": true,
     "notify_daily_summary": true,
+    "notify_market_change": true,
     "silent_mode": false,
     "enable_commands": true
   }
