@@ -13,6 +13,7 @@ class TradingLogger:
     def __init__(self, config):
         self.config = config
         self.log_dir = config['logging']['log_dir']
+        self.max_backup_count = int(config.get('logging', {}).get('max_backup_count', 30) or 30)
         
         # 로그 디렉토리 생성
         os.makedirs(self.log_dir, exist_ok=True)
@@ -57,7 +58,7 @@ class TradingLogger:
             filename=os.path.join(self.log_dir, 'trading_bot.log'),
             when='H',
             interval=self.config['logging']['rotation_hours'],
-            backupCount=self.config['logging']['max_backup_count'],
+            backupCount=self.max_backup_count,
             encoding='utf-8'
         )
         file_handler.setLevel(getattr(logging, self.config['logging']['file_log_level']))
@@ -90,7 +91,7 @@ class TradingLogger:
             filename=os.path.join(self.log_dir, 'trades.log'),
             when='H',
             interval=self.config['logging']['rotation_hours'],
-            backupCount=self.config['logging']['max_backup_count'],
+            backupCount=self.max_backup_count,
             encoding='utf-8'
         )
         trade_format = logging.Formatter('%(message)s')
@@ -122,7 +123,7 @@ class TradingLogger:
             filename=os.path.join(self.log_dir, 'statistics.log'),
             when='D',
             interval=1,
-            backupCount=365,
+            backupCount=self.max_backup_count,
             encoding='utf-8'
         )
         stats_format = logging.Formatter('%(message)s')
@@ -149,7 +150,7 @@ class TradingLogger:
             filename=os.path.join(self.log_dir, 'decisions.log'),
             when='D',
             interval=1,
-            backupCount=30,
+            backupCount=self.max_backup_count,
             encoding='utf-8'
         )
         decision_format = logging.Formatter('%(message)s')

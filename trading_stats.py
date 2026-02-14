@@ -137,11 +137,33 @@ class TradingStats:
             buy_fee_krw = float(position.get('buy_fee_krw', 0) or 0)
             sell_fee_krw = float(sell_fee_krw or 0)
             profit_after_fees_krw = float(profit_krw) - buy_fee_krw
+            buy_meta = position.get('buy_meta', {}) if isinstance(position.get('buy_meta'), dict) else {}
+            sell_meta_dict = sell_meta if isinstance(sell_meta, dict) else {}
+
+            stop_price = float(buy_meta.get('stop_price', 0) or 0)
+            risk_unit = (buy_price - stop_price) if stop_price > 0 else 0.0
+            r_multiple = sell_meta_dict.get('r_multiple', None)
+            if r_multiple is None and risk_unit > 0:
+                r_multiple = (sell_price - buy_price) / risk_unit
+
+            strategy = str(buy_meta.get('strategy', '') or '')
+            entry_time_iso = position['timestamp'].isoformat() if position.get('timestamp') else None
             
             # 거래 기록 저장
             now = datetime.now()
             trade_record = {
                 'timestamp': now.isoformat(),
+                'entry_time': entry_time_iso,
+                'exit_time': now.isoformat(),
+                'symbol': coin,
+                'entry_price': buy_price,
+                'stop_price': stop_price,
+                'position_size': position['amount'],
+                'exit_price': sell_price,
+                'realized_pnl_krw': profit_krw,
+                'r_multiple': float(r_multiple) if r_multiple is not None else None,
+                'strategy': strategy,
+                'risk_unit': float(risk_unit) if risk_unit > 0 else None,
                 'coin': coin,
                 'buy_price': buy_price,
                 'sell_price': sell_price,
@@ -156,8 +178,8 @@ class TradingStats:
                 'holding_time': (now - position['timestamp']).total_seconds(),
                 'buy_signals': position.get('buy_signals', []),
                 'buy_score': position.get('buy_score', 0),
-                'buy_meta': position.get('buy_meta', {}),
-                'sell_meta': sell_meta if isinstance(sell_meta, dict) else {},
+                'buy_meta': buy_meta,
+                'sell_meta': sell_meta_dict,
                 'uuid': position.get('uuid'),
             }
             

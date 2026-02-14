@@ -1,11 +1,10 @@
 """
-트레이딩 엔진 - 멀티 시그널 전략 실행
+트레이딩 엔진 - 레짐 기반 전략 실행
 """
 
 import pyupbit
 import pyupbit.request_api as request_api
 import pandas as pd
-import numpy as np
 import time
 import re
 from datetime import datetime
@@ -16,232 +15,274 @@ class TradingEngine:
         self.config = config
         self.logger = logger
         self.stats = stats
-        
         self.upbit = None
-        # Fee rate (fraction). Default 0.05% = 0.0005
+
+        trading_cfg = config.get("trading", {}) or {}
+        strategy_cfg = config.get("strategy", {}) or {}
+        risk_cfg = config.get("risk_management", {}) or {}
+        ind_cfg = config.get("indicators", {}) or {}
+
         self.FEE = 0.0005
         try:
-            fee_pct = config.get('trading', {}).get('fee_pct', None)
+            fee_pct = trading_cfg.get("fee_pct", None)
             if fee_pct is not None:
                 self.FEE = float(fee_pct) / 100
         except Exception:
             self.FEE = 0.0005
-        
-        # 설정값 로드
-        self.bb_period = config['indicators']['bb_period']
-        self.bb_std = config['indicators']['bb_std']
-        self.rsi_period = config['indicators']['rsi_period']
-        self.min_signals = config['indicators']['min_signals_required']
-        
-        # 신호 점수제
-        self.use_signal_scoring = config['indicators'].get('use_signal_scoring', False)
-        self.min_signal_score = config['indicators'].get('min_signal_score', 7)
-        
-        # 추세 확인
-        self.check_trend = config['indicators'].get('check_trend', False)
-        self.min_trend_strength = config['indicators'].get('min_trend_strength', 0.02)
-        
-        # ATR 설정
-        self.use_atr = config['risk_management'].get('use_atr', False)
-        self.atr_period = config['risk_management'].get('atr_period', 14)
-        self.atr_sl_multiplier = config['risk_management'].get('atr_stop_loss_multiplier', 1.5)
-        self.atr_tp_multiplier = config['risk_management'].get('atr_take_profit_multiplier', 2.5)
-        # ATR 기반 손절이 너무 타이트해지는 것을 방지 (예: minute1 ATR로 -0.3% 손절 과다 방지)
-        # 값은 퍼센트(예: -0.7)로 설정하며, ATR 기반 손절이 이 값보다 덜(=더 타이트)하면 이 값으로 완화합니다.
-        self.min_atr_stop_loss = None
-        try:
-            min_atr_sl_pct = config['risk_management'].get('min_atr_stop_loss_pct', None)
-            if min_atr_sl_pct is not None:
-                self.min_atr_stop_loss = float(min_atr_sl_pct) / 100
-        except Exception:
-            self.min_atr_stop_loss = None
-        
-        # 고정 % 손익
-        self.stop_loss = config['risk_management']['stop_loss_pct'] / 100
-        self.take_profit_1 = config['risk_management']['take_profit_1_pct'] / 100
-        self.take_profit_2 = config['risk_management']['take_profit_2_pct'] / 100
-        self.trailing_stop = config['risk_management']['trailing_stop_pct'] / 100
-        self.trailing_activation = config['risk_management']['trailing_activation_pct'] / 100
-        
-        # 주문 설정
-        self.order_type = config['trading'].get('order_type', 'market')
-        self.limit_wait_seconds = config['trading'].get('limit_order_wait_seconds', 3)
-        
-        # 안전 장치
-        self.max_spread_pct = config['trading'].get('max_spread_percent', 0.5)
-        self.min_orderbook_depth = config['trading'].get('min_orderbook_depth_krw', 5000000)
 
-        # RSI 진입 필터 (수익 관점에서 과매도 캐치 방지)
-        try:
-            self.rsi_buy_min = float(config.get('indicators', {}).get('rsi_buy_min', 50))
-        except Exception:
-            self.rsi_buy_min = 50.0
-        try:
-            self.rsi_buy_max = float(config.get('indicators', {}).get('rsi_buy_max', 70))
-        except Exception:
-            self.rsi_buy_max = 70.0
+        self.max_total_investment = float(trading_cfg.get("max_total_investment", 3000000))
+        self.max_spread_pct = float(trading_cfg.get("max_spread_percent", 0.5))
+        self.min_orderbook_depth = float(trading_cfg.get("min_orderbook_depth_krw", 5000000))
+        self.order_type = trading_cfg.get("order_type", "market")
+        self.limit_wait_seconds = int(trading_cfg.get("limit_order_wait_seconds", 3))
 
-        # 매수 품질 필터(과매매/수수료 드래그 완화 목적)
-        ind_cfg = config.get('indicators', {}) or {}
-        val = ind_cfg.get('require_price_above_ma20', True)
-        self.require_price_above_ma20 = True if val is None else bool(val)
-        val = ind_cfg.get('require_strong_trigger', True)
-        self.require_strong_trigger = True if val is None else bool(val)
-        try:
-            self.strong_trigger_min_volume_ratio = float(ind_cfg.get('strong_trigger_min_volume_ratio', 1.8))
-        except Exception:
-            self.strong_trigger_min_volume_ratio = 1.8
+        self.rsi_period = int(ind_cfg.get("rsi_period", 14))
+        self.bb_period = int(ind_cfg.get("bb_period", 20))
+        self.bb_std = float(ind_cfg.get("bb_std", 2.0))
+        self.atr_period = int(risk_cfg.get("atr_period", 14))
 
-        # 전략 설정: 비용 민감 추세 돌파 (기존 룰 사실상 초기화)
-        strategy_cfg = config.get('strategy', {}) or {}
-        self.strategy_mode = str(strategy_cfg.get('mode', 'trend_breakout')).lower()
-        self.entry_interval = str(strategy_cfg.get('entry_interval', 'minute1'))
-        self.htf_interval = str(strategy_cfg.get('htf_interval', 'minute15'))
-        try:
-            self.entry_breakout_lookback = int(strategy_cfg.get('entry_breakout_lookback', 20))
-        except Exception:
-            self.entry_breakout_lookback = 20
-        try:
-            self.entry_breakout_buffer = float(strategy_cfg.get('entry_breakout_buffer_pct', 0.05)) / 100
-        except Exception:
-            self.entry_breakout_buffer = 0.0005
-        try:
-            self.entry_volume_ratio_min = float(strategy_cfg.get('entry_volume_ratio_min', 1.6))
-        except Exception:
-            self.entry_volume_ratio_min = 1.6
-        try:
-            self.entry_rsi_min = float(strategy_cfg.get('entry_rsi_min', 52))
-        except Exception:
-            self.entry_rsi_min = 52.0
-        try:
-            self.entry_rsi_max = float(strategy_cfg.get('entry_rsi_max', 72))
-        except Exception:
-            self.entry_rsi_max = 72.0
-        try:
-            self.entry_ma_fast = int(strategy_cfg.get('entry_ma_fast', 20))
-        except Exception:
-            self.entry_ma_fast = 20
-        try:
-            self.entry_ma_slow = int(strategy_cfg.get('entry_ma_slow', 60))
-        except Exception:
-            self.entry_ma_slow = 60
-        try:
-            self.htf_ma_fast = int(strategy_cfg.get('htf_ma_fast', 20))
-        except Exception:
-            self.htf_ma_fast = 20
-        try:
-            self.htf_ma_slow = int(strategy_cfg.get('htf_ma_slow', 50))
-        except Exception:
-            self.htf_ma_slow = 50
-        try:
-            self.entry_min_score = int(strategy_cfg.get('entry_min_score', 8))
-        except Exception:
-            self.entry_min_score = 8
+        self.entry_interval = str(strategy_cfg.get("entry_interval", "minute20"))
+        self.signal_candle_minutes = int(strategy_cfg.get("signal_candle_minutes", 20))
+        self.analysis_lookback = int(strategy_cfg.get("analysis_lookback", 240))
 
-        # 매도 관리
-        rm_cfg = config.get('risk_management', {}) or {}
-        try:
-            self.min_hold_minutes = int(rm_cfg.get('min_hold_minutes', 20))
-        except Exception:
-            self.min_hold_minutes = 20
-        try:
-            self.max_hold_minutes = int(rm_cfg.get('max_hold_minutes', 360))
-        except Exception:
-            self.max_hold_minutes = 360
-        val = rm_cfg.get('use_partial_take_profit', False)
-        self.use_partial_take_profit = False if val is None else bool(val)
+        self.stop_loss = float(risk_cfg.get("stop_loss_pct", -1.8)) / 100.0
+        self.trailing_stop = float(risk_cfg.get("trailing_stop_pct", 1.0)) / 100.0
+        self.trailing_activation = float(risk_cfg.get("trailing_activation_pct", 2.0)) / 100.0
+        self.min_hold_minutes = int(risk_cfg.get("min_hold_minutes", 20))
+        self.max_hold_minutes = int(risk_cfg.get("max_hold_minutes", 360))
+        self.time_stop_candles = int(risk_cfg.get("time_stop_candles", 10))
+        self.default_risk_per_trade_pct = self._parse_risk_pct(risk_cfg.get("risk_per_trade_pct", 0.4), 0.004)
 
-        # OHLCV 캐시: 과도한 API 호출/요청 제한 완화
+        self.strategy_mode = str(strategy_cfg.get("mode", "regime_spec")).lower()
+        self.regime_reference_ticker = self._normalize_ticker(strategy_cfg.get("regime_reference", "KRW-BTC"))
+        self.regime_check_minutes = int(strategy_cfg.get("regime_check_minutes", 20))
+        self.regime_confirm_count = int(strategy_cfg.get("regime_confirm_count", 3))
+        self.regime_min_hold_minutes = int(strategy_cfg.get("regime_min_hold_minutes", 0))
+        self.max_positions = int(strategy_cfg.get("max_positions", trading_cfg.get("max_coins", 2)))
+
+        time_filter_cfg = strategy_cfg.get("entry_time_filter", {}) or {}
+        self.entry_block_start_hour = int(time_filter_cfg.get("start_hour", 2))
+        self.entry_block_end_hour = int(time_filter_cfg.get("end_hour", 6))
+        self.volatility_tr_atr_max = float(strategy_cfg.get("volatility_tr_atr_max", 3.0))
+
+        btc_filter_cfg = strategy_cfg.get("btc_filter", {}) or {}
+        self.btc_filter_enabled = bool(btc_filter_cfg.get("enabled", True))
+        self.btc_filter_ticker = self._normalize_ticker(
+            btc_filter_cfg.get("ticker", self.regime_reference_ticker)
+        )
+        self.btc_filter_ema_period = int(btc_filter_cfg.get("ema_period", 50))
+
+        self.sol_breakout_lookback = int(strategy_cfg.get("sol_breakout_lookback", 48))
+        self.sol_retest_atr_tolerance = float(strategy_cfg.get("sol_retest_atr_tolerance", 0.2))
+        self.sol_stop_atr = float(strategy_cfg.get("sol_stop_atr", 0.5))
+        self.sol_partial_tp_r = float(strategy_cfg.get("sol_partial_tp_r", 1.2))
+        self.sol_trailing_activate_r = float(strategy_cfg.get("sol_trailing_activate_r", 2.2))
+        self.sol_trailing_stop_pct = float(strategy_cfg.get("sol_trailing_stop_pct", 1.2)) / 100.0
+
+        self.doge_volume_spike_min = float(strategy_cfg.get("doge_volume_spike_min", 1.3))
+        self.doge_rsi_min = float(strategy_cfg.get("doge_rsi_min", 55))
+        self.doge_pullback_atr_tolerance = float(strategy_cfg.get("doge_pullback_atr_tolerance", 0.2))
+        self.doge_stop_pct = float(strategy_cfg.get("doge_stop_pct", 0.8)) / 100.0
+        self.doge_time_stop_candles = int(strategy_cfg.get("doge_time_stop_candles", 6))
+        self.doge_target_r = float(strategy_cfg.get("doge_target_r", 1.0))
+
+        self.ada_range_lookback = int(strategy_cfg.get("ada_range_lookback", 96))
+        self.ada_entry_lower_pct = float(strategy_cfg.get("ada_entry_lower_pct", 0.15))
+        self.ada_take_profit_upper_pct = float(strategy_cfg.get("ada_take_profit_upper_pct", 0.85))
+        self.ada_rsi_max = float(strategy_cfg.get("ada_rsi_max", 28))
+        self.ada_stop_pct = float(strategy_cfg.get("ada_stop_pct", 0.9)) / 100.0
+
+        self.universe = self._build_universe(strategy_cfg)
+        self.base_weight_caps = self._build_weight_caps(strategy_cfg)
+        self.risk_per_symbol_pct = self._build_risk_per_symbol(strategy_cfg, risk_cfg)
+
+        self.global_regime = "RANGE"
+        self._regime_candidate = None
+        self._regime_candidate_count = 0
+        self._last_regime_check = None
+        self._regime_changed_at = None
+
         self._ohlcv_cache = {}
-        
-        # pyupbit Remaining-Req 파싱 오류 우회 패치
+
         self._patch_pyupbit_remaining_req_parser()
-    
+
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _parse_risk_pct(value, default=0.004):
+        try:
+            pct = float(value)
+        except Exception:
+            pct = float(default)
+        if pct >= 0.1:
+            pct = pct / 100.0
+        return max(0.0005, min(0.03, pct))
+
+    @staticmethod
+    def _normalize_ticker(ticker_or_symbol):
+        value = str(ticker_or_symbol or "").upper().strip()
+        if not value:
+            return ""
+        if value.startswith("KRW-"):
+            return value
+        if "-" in value:
+            return f"KRW-{value.split('-')[-1]}"
+        return f"KRW-{value}"
+
+    @staticmethod
+    def _symbol(ticker):
+        value = str(ticker or "").upper()
+        if "-" in value:
+            return value.split("-")[-1]
+        return value
+
+    @staticmethod
+    def _interval_to_minutes(interval):
+        value = str(interval or "").lower()
+        if value.startswith("minute"):
+            try:
+                return max(1, int(value.replace("minute", "")))
+            except Exception:
+                return 1
+        if value == "day":
+            return 1440
+        if value == "week":
+            return 10080
+        return 1
+
+    def _build_universe(self, strategy_cfg):
+        raw_universe = strategy_cfg.get("universe")
+        if not raw_universe:
+            raw_universe = ["SOL", "DOGE", "ADA"]
+
+        universe = []
+        for value in raw_universe:
+            ticker = self._normalize_ticker(value)
+            if ticker and ticker not in universe:
+                universe.append(ticker)
+        return universe
+
+    def _build_weight_caps(self, strategy_cfg):
+        default_caps = {
+            "SOL": 0.50,
+            "DOGE": 0.40,
+            "ADA": 0.35,
+        }
+        raw_caps = strategy_cfg.get("base_weight_caps", {}) or {}
+        for key, value in raw_caps.items():
+            symbol = self._symbol(key)
+            weight = self._safe_float(value, default_caps.get(symbol, 0.0))
+            default_caps[symbol] = max(0.0, min(1.0, weight))
+        return default_caps
+
+    def _build_risk_per_symbol(self, strategy_cfg, risk_cfg):
+        default = {
+            "SOL": 0.005,
+            "DOGE": 0.004,
+            "ADA": 0.003,
+        }
+        raw = strategy_cfg.get("risk_per_symbol_pct", {}) or risk_cfg.get("risk_per_symbol_pct", {}) or {}
+        for key, value in raw.items():
+            symbol = self._symbol(key)
+            default[symbol] = self._parse_risk_pct(value, default.get(symbol, self.default_risk_per_trade_pct))
+        return default
+
+    def get_universe(self):
+        return list(self.universe)
+
+    def get_global_regime(self):
+        return str(self.global_regime)
+
+    def get_base_weight_cap(self, ticker):
+        return float(self.base_weight_caps.get(self._symbol(ticker), 0.0))
+
     def _patch_pyupbit_remaining_req_parser(self):
         """Remaining-Req 헤더 파싱 실패로 인한 예외를 완화"""
         try:
-            # 이미 패치된 경우 중복 방지
             if getattr(request_api, "_patched_remaining_req_parser", False):
                 return
-            
+
             original_parse = request_api._parse
-            
+
             def safe_parse(remaining_req):
-                # 정상 케이스는 원래 파서 사용
                 try:
                     return original_parse(remaining_req)
                 except Exception:
                     pass
-                
-                # 변형 헤더 대응 (대소문자/공백/순서 유연 처리)
+
                 text = str(remaining_req or "")
                 group_match = re.search(r"group\s*=\s*([a-zA-Z\-]+)", text)
                 min_match = re.search(r"min\s*=\s*([0-9]+)", text)
                 sec_match = re.search(r"sec\s*=\s*([0-9]+)", text)
-                
+
                 return {
                     "group": group_match.group(1).lower() if group_match else "unknown",
                     "min": int(min_match.group(1)) if min_match else 0,
                     "sec": int(sec_match.group(1)) if sec_match else 0,
                 }
-            
+
             request_api._parse = safe_parse
             request_api._patched_remaining_req_parser = True
             self.logger.info("✅ pyupbit Remaining-Req 파서 안전 패치 적용")
-        
+
         except Exception as e:
             self.logger.warning(f"⚠️ pyupbit 파서 패치 실패: {e}")
-    
+
     def check_orderbook_safety(self, ticker):
         """호가창 안전성 체크 (스프레드, 호가잔량)"""
         try:
             orderbook = pyupbit.get_orderbook(ticker)
-            if not orderbook or 'orderbook_units' not in orderbook:
+            if isinstance(orderbook, list) and orderbook:
+                orderbook = orderbook[0]
+            if not isinstance(orderbook, dict) or "orderbook_units" not in orderbook:
                 return False, "호가 정보 없음", {"ticker": ticker}
-            
-            units = orderbook['orderbook_units'][0]
-            ask_price = units['ask_price']  # 매도 1호가
-            bid_price = units['bid_price']  # 매수 1호가
-            ask_size = units['ask_size']    # 매도 잔량
-            bid_size = units['bid_size']    # 매수 잔량
+            if not orderbook["orderbook_units"]:
+                return False, "호가 정보 없음", {"ticker": ticker}
+
+            units = orderbook["orderbook_units"][0]
+            ask_price = self._safe_float(units.get("ask_price", 0))
+            bid_price = self._safe_float(units.get("bid_price", 0))
+            ask_size = self._safe_float(units.get("ask_size", 0))
+            bid_size = self._safe_float(units.get("bid_size", 0))
+
             details = {
                 "ticker": ticker,
-                "ask_price": float(ask_price),
-                "bid_price": float(bid_price),
-                "ask_size": float(ask_size),
-                "bid_size": float(bid_size),
+                "ask_price": ask_price,
+                "bid_price": bid_price,
+                "ask_size": ask_size,
+                "bid_size": bid_size,
             }
 
             if ask_price <= 0 or bid_price <= 0:
                 return False, "호가 가격 이상", details
-            
-            # 스프레드 체크
+
             spread_pct = ((ask_price - bid_price) / bid_price) * 100
             details["spread_pct"] = float(spread_pct)
             if spread_pct > self.max_spread_pct:
                 return False, f"스프레드 과다({spread_pct:.2f}%)", details
-            
-            # 호가 잔량 체크 (매수/매도 모두)
+
             bid_depth_krw = bid_price * bid_size
             ask_depth_krw = ask_price * ask_size
             details["bid_depth_krw"] = float(bid_depth_krw)
             details["ask_depth_krw"] = float(ask_depth_krw)
-            
+
             if bid_depth_krw < self.min_orderbook_depth:
                 return False, f"매수호가 부족({bid_depth_krw:,.0f}원)", details
-            
             if ask_depth_krw < self.min_orderbook_depth:
                 return False, f"매도호가 부족({ask_depth_krw:,.0f}원)", details
-            
+
             return True, "안전", details
-            
         except Exception as e:
             return False, f"호가 체크 오류: {e}", {"ticker": ticker, "error": f"{type(e).__name__}: {e}"}
-    
+
     def connect(self, access_key, secret_key):
         """업비트 API 연결"""
         try:
-            # 기본 키 형식 검증
             if not access_key or not secret_key:
                 self.logger.error("업비트 API 연결 실패: access_key 또는 secret_key 누락")
                 return False
@@ -254,34 +295,29 @@ class TradingEngine:
                 )
 
             self.upbit = pyupbit.Upbit(access_key, secret_key)
-            
-            # RemainingReqParsingError 등 일시 오류 우회용 재시도
+
             last_error = None
             for attempt in range(1, 6):
                 try:
                     balance = self.upbit.get_balance("KRW")
-                    
                     if balance is None:
                         last_error = "KRW 잔고 조회 결과가 None"
                         time.sleep(0.7)
                         continue
-                    
                     balance = float(balance)
                     self.logger.info(f"✅ 업비트 API 연결 성공 | 보유 현금: {balance:,.0f}원")
                     return True
-                
                 except Exception as e:
                     last_error = f"{type(e).__name__}: {e}"
                     self.logger.warning(f"API 연결 재시도 {attempt}/5 실패 - {last_error}")
                     time.sleep(0.7)
-            
-            # 마지막 진단
+
             diag = None
             try:
                 diag = self.upbit.get_balances()
             except Exception as diag_e:
                 diag = f"get_balances 예외: {type(diag_e).__name__}: {diag_e}"
-            
+
             self.logger.error(
                 "업비트 API 연결 실패: KRW 잔고 조회 실패. "
                 f"last_error={last_error} | 진단 get_balances={diag}"
@@ -290,45 +326,23 @@ class TradingEngine:
         except Exception as e:
             self.logger.log_error("업비트 API 연결 실패", e)
             return False
-    
-    def calculate_indicators(self, df):
-        """기술 지표 계산"""
-        
-        # 볼린저밴드
-        df['bb_middle'] = df['close'].rolling(self.bb_period).mean()
-        df['bb_std'] = df['close'].rolling(self.bb_period).std()
-        df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * self.bb_std)
-        df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * self.bb_std)
-        
-        # RSI
-        delta = df['close'].diff()
+
+    def _calc_rsi(self, close):
+        delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(self.rsi_period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(self.rsi_period).mean()
         rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # MACD
-        exp1 = df['close'].ewm(span=self.config['indicators']['macd_fast'], adjust=False).mean()
-        exp2 = df['close'].ewm(span=self.config['indicators']['macd_slow'], adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=self.config['indicators']['macd_signal'], adjust=False).mean()
-        
-        # 거래량 이동평균
-        df['volume_ma'] = df['volume'].rolling(20).mean()
-        
-        # 이동평균선
-        df['ma5'] = df['close'].rolling(5).mean()
-        df['ma20'] = df['close'].rolling(20).mean()
-        
-        # ATR (Average True Range)
-        high_low = df['high'] - df['low']
-        high_close = abs(df['high'] - df['close'].shift())
-        low_close = abs(df['low'] - df['close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        df['atr'] = true_range.rolling(self.atr_period).mean()
-        
-        return df
+        return 100 - (100 / (1 + rs))
+
+    def _calc_true_range(self, df):
+        high_low = df["high"] - df["low"]
+        high_close = (df["high"] - df["close"].shift()).abs()
+        low_close = (df["low"] - df["close"].shift()).abs()
+        return pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
+    def _calc_atr(self, df):
+        true_range = self._calc_true_range(df)
+        return true_range.rolling(self.atr_period).mean()
 
     def _get_cached_ohlcv(self, ticker, interval="minute1", count=200, ttl_seconds=2):
         """OHLCV 조회 with 단기 캐시 (요청 수 제한 완화)."""
@@ -344,344 +358,763 @@ class TradingEngine:
         if df is not None:
             self._ohlcv_cache[key] = (now, df.copy())
         return df
-    
-    def check_buy_signal(self, ticker):
-        """매수 신호 확인 - 비용 민감 추세 돌파 전략."""
 
-        try:
-            base_count = max(260, self.entry_ma_slow + 60, self.entry_breakout_lookback + 60)
-            df = self._get_cached_ohlcv(
-                ticker,
-                interval=self.entry_interval,
-                count=base_count,
-                ttl_seconds=2,
+    def _get_resampled_ohlcv(self, ticker, minutes=20, count=220, ttl_seconds=4):
+        """5분봉을 기반으로 N분봉으로 리샘플링."""
+        base_minutes = 5
+        factor = max(1, int(minutes // base_minutes))
+        base_count = max(200, int(count * factor + 40))
+
+        df = self._get_cached_ohlcv(
+            ticker=ticker,
+            interval=f"minute{base_minutes}",
+            count=base_count,
+            ttl_seconds=ttl_seconds,
+        )
+        if df is None or len(df) < max(80, factor * 20):
+            return None
+
+        work = df.copy()
+        if not isinstance(work.index, pd.DatetimeIndex):
+            work.index = pd.to_datetime(work.index)
+
+        rule = f"{int(minutes)}min"
+        resampled = (
+            work.resample(rule, label="right", closed="right")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                    "value": "sum",
+                }
             )
-            if df is None or len(df) < max(self.entry_ma_slow + 5, self.entry_breakout_lookback + 5, 80):
-                self.logger.debug(f"  {ticker} 데이터 부족")
+            .dropna()
+        )
+
+        if len(resampled) < max(60, int(count * 0.5)):
+            return None
+        return resampled.tail(max(count, 120))
+
+    def _is_entry_time_blocked(self):
+        now_hour = datetime.now().hour
+        start = int(self.entry_block_start_hour)
+        end = int(self.entry_block_end_hour)
+        if start == end:
+            return False
+        if start < end:
+            return start <= now_hour < end
+        return now_hour >= start or now_hour < end
+
+    def _risk_pct_for_symbol(self, ticker):
+        symbol = self._symbol(ticker)
+        return float(self.risk_per_symbol_pct.get(symbol, self.default_risk_per_trade_pct))
+
+    def _check_btc_trend_filter(self):
+        if not self.btc_filter_enabled:
+            return True, {"enabled": False}
+
+        df = self._get_resampled_ohlcv(
+            self.btc_filter_ticker,
+            minutes=self.signal_candle_minutes,
+            count=max(90, self.btc_filter_ema_period + 30),
+            ttl_seconds=10,
+        )
+        if df is None or len(df) < self.btc_filter_ema_period + 2:
+            return False, {"enabled": True, "reason": "btc_data_short"}
+
+        work = df.copy()
+        work["ema_btc"] = work["close"].ewm(span=self.btc_filter_ema_period, adjust=False).mean()
+        row = work.iloc[-2]
+        close = self._safe_float(row.get("close", 0), 0)
+        ema = self._safe_float(row.get("ema_btc", 0), 0)
+        passed = close > ema > 0
+        return passed, {
+            "enabled": True,
+            "ticker": self.btc_filter_ticker,
+            "close": float(close),
+            "ema": float(ema),
+            "passed": bool(passed),
+        }
+
+    def _persist_position_meta(self, ticker, position, buy_meta):
+        if not isinstance(position, dict):
+            return
+        position["buy_meta"] = buy_meta if isinstance(buy_meta, dict) else {}
+        try:
+            self.stats.save_positions()
+        except Exception:
+            pass
+
+    def _classify_structure(self, df):
+        """HH/HL vs LH/LL 단순 구조 분류"""
+        if df is None or len(df) < 30:
+            return "UNKNOWN"
+
+        highs = df["high"].iloc[-30:-2]
+        lows = df["low"].iloc[-30:-2]
+        if len(highs) < 20 or len(lows) < 20:
+            return "UNKNOWN"
+
+        pivot = int(len(highs) * 0.5)
+        older_high = self._safe_float(highs.iloc[:pivot].max(), 0)
+        recent_high = self._safe_float(highs.iloc[pivot:].max(), 0)
+        older_low = self._safe_float(lows.iloc[:pivot].min(), 0)
+        recent_low = self._safe_float(lows.iloc[pivot:].min(), 0)
+
+        if older_high <= 0 or older_low <= 0:
+            return "UNKNOWN"
+
+        hh = recent_high > older_high * 1.001
+        hl = recent_low > older_low * 0.999
+        lh = recent_high < older_high * 0.999
+        ll = recent_low < older_low * 1.001
+
+        if hh and hl:
+            return "BULL"
+        if lh and ll:
+            return "BEAR"
+        return "RANGE"
+
+    def _estimate_equity_krw(self):
+        cash = self.get_balance("KRW")
+        total = float(cash or 0)
+
+        for ticker, pos in list(self.stats.positions.items()):
+            try:
+                price = self.get_current_price(ticker)
+                if not price:
+                    price = self._safe_float(pos.get("buy_price", 0), 0)
+                amount = self._safe_float(pos.get("amount", 0), 0)
+                total += float(price) * amount
+            except Exception:
+                continue
+        return float(total)
+
+    def _estimate_total_invested_cost(self):
+        total = 0.0
+        for _, pos in list(self.stats.positions.items()):
+            try:
+                total += self._safe_float(pos.get("buy_price", 0), 0) * self._safe_float(pos.get("amount", 0), 0)
+            except Exception:
+                continue
+        return float(total)
+
+    def _estimate_position_exposure_krw(self, ticker):
+        pos = self.stats.positions.get(ticker)
+        if not pos:
+            return 0.0
+        price = self.get_current_price(ticker)
+        if not price:
+            price = self._safe_float(pos.get("buy_price", 0), 0)
+        return self._safe_float(price, 0) * self._safe_float(pos.get("amount", 0), 0)
+
+    def _size_by_risk(self, ticker, entry_price, stop_price):
+        stop_distance = abs(float(entry_price) - float(stop_price))
+        if stop_distance <= 0:
+            return {
+                "equity_krw": 0.0,
+                "risk_krw": 0.0,
+                "risk_pct": 0.0,
+                "qty_by_risk": 0.0,
+                "risk_invest_krw": 0.0,
+                "weight_cap_krw": 0.0,
+                "weight_remaining_krw": 0.0,
+                "total_cap_remaining_krw": 0.0,
+                "recommended_invest_krw": 0.0,
+            }
+
+        equity = self._estimate_equity_krw()
+        risk_pct = self._risk_pct_for_symbol(ticker)
+        risk_krw = equity * risk_pct
+        qty_by_risk = risk_krw / stop_distance
+        risk_invest_krw = qty_by_risk * entry_price
+
+        weight_cap_krw = equity * self.get_base_weight_cap(ticker)
+        if weight_cap_krw <= 0:
+            weight_cap_krw = self.max_total_investment
+        current_exposure = self._estimate_position_exposure_krw(ticker)
+        weight_remaining_krw = max(0.0, weight_cap_krw - current_exposure)
+
+        total_invested = self._estimate_total_invested_cost()
+        total_cap_remaining = max(0.0, self.max_total_investment - total_invested)
+        recommended = min(risk_invest_krw, weight_remaining_krw, total_cap_remaining)
+
+        return {
+            "equity_krw": float(equity),
+            "risk_krw": float(risk_krw),
+            "risk_pct": float(risk_pct * 100.0),
+            "qty_by_risk": float(max(0.0, qty_by_risk)),
+            "risk_invest_krw": float(max(0.0, risk_invest_krw)),
+            "weight_cap_krw": float(weight_cap_krw),
+            "weight_remaining_krw": float(weight_remaining_krw),
+            "total_cap_remaining_krw": float(total_cap_remaining),
+            "recommended_invest_krw": float(max(0.0, recommended)),
+        }
+
+    def detect_global_regime(self):
+        """20분봉 EMA50/EMA200 기반 레짐 후보 계산."""
+        df = self._get_resampled_ohlcv(
+            self.regime_reference_ticker,
+            minutes=self.signal_candle_minutes,
+            count=260,
+            ttl_seconds=12,
+        )
+        if df is None or len(df) < 210:
+            return "RANGE", {"reason": "global_data_short"}
+
+        df = df.copy()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+        cur = df.iloc[-2]
+
+        close = self._safe_float(cur.get("close", 0), 0)
+        ema50 = self._safe_float(cur.get("ema50", 0), 0)
+        ema200 = self._safe_float(cur.get("ema200", 0), 0)
+
+        if close > ema50 > ema200:
+            candidate = "BULL"
+        elif close < ema50 < ema200:
+            candidate = "BEAR"
+        else:
+            candidate = "RANGE"
+
+        meta = {
+            "reference_ticker": self.regime_reference_ticker,
+            "close": float(close),
+            "ema50": float(ema50),
+            "ema200": float(ema200),
+            "candidate": candidate,
+            "candle_ts": str(getattr(cur, "name", "") or ""),
+        }
+        return candidate, meta
+
+    def update_global_regime(self, force=False):
+        """3연속 확인으로 레짐 전환 확정."""
+        now = datetime.now()
+        if not force and self._last_regime_check:
+            elapsed = (now - self._last_regime_check).total_seconds()
+            if elapsed < max(60, self.regime_check_minutes * 60):
+                return self.global_regime, {"skipped": True}
+
+        self._last_regime_check = now
+        candidate, detect_meta = self.detect_global_regime()
+        previous_regime = self.global_regime
+
+        if candidate == self.global_regime:
+            self._regime_candidate = None
+            self._regime_candidate_count = 0
+            applied = False
+        else:
+            if candidate == self._regime_candidate:
+                self._regime_candidate_count += 1
+            else:
+                self._regime_candidate = candidate
+                self._regime_candidate_count = 1
+
+            can_switch = True
+            if self.regime_min_hold_minutes > 0 and self._regime_changed_at:
+                held_minutes = (now - self._regime_changed_at).total_seconds() / 60.0
+                can_switch = held_minutes >= self.regime_min_hold_minutes
+
+            if self._regime_candidate_count >= self.regime_confirm_count and can_switch:
+                self.global_regime = candidate
+                self._regime_changed_at = now
+                self._regime_candidate = None
+                self._regime_candidate_count = 0
+                applied = True
+            else:
+                applied = False
+
+        payload = {
+            "current": self.global_regime,
+            "previous": previous_regime,
+            "candidate": candidate,
+            "candidate_count": int(self._regime_candidate_count),
+            "confirm_count": int(self.regime_confirm_count),
+            "min_hold_minutes": int(self.regime_min_hold_minutes),
+            "applied": bool(applied),
+            "force": bool(force),
+            "detect": detect_meta,
+        }
+        self.logger.log_decision("REGIME_UPDATE", payload)
+        if applied:
+            self.logger.info(f"📈 글로벌 레짐 전환: {previous_regime} -> {self.global_regime}")
+        return self.global_regime, payload
+
+    def analyze_symbol(self, ticker):
+        """20분봉 기반 전략 상태 계산."""
+        lookback = max(self.analysis_lookback, self.ada_range_lookback + 20, self.sol_breakout_lookback + 20, 220)
+        df = self._get_resampled_ohlcv(
+            ticker=ticker,
+            minutes=self.signal_candle_minutes,
+            count=lookback,
+            ttl_seconds=4,
+        )
+        if df is None or len(df) < 210:
+            return None
+
+        df = df.copy()
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+        df["rsi"] = self._calc_rsi(df["close"])
+        df["tr"] = self._calc_true_range(df)
+        df["atr"] = self._calc_atr(df)
+        df["volume_ma20"] = df["volume"].rolling(20).mean()
+
+        cur = df.iloc[-2]
+        prev = df.iloc[-3]
+        close = self._safe_float(cur.get("close", 0), 0)
+        prev_close = self._safe_float(prev.get("close", close), close)
+        high = self._safe_float(cur.get("high", close), close)
+        low = self._safe_float(cur.get("low", close), close)
+        tr = self._safe_float(cur.get("tr", 0), 0)
+        atr = self._safe_float(cur.get("atr", 0), 0)
+        rsi = self._safe_float(cur.get("rsi", 50), 50)
+        ema20 = self._safe_float(cur.get("ema20", close), close)
+        ema50 = self._safe_float(cur.get("ema50", close), close)
+        ema200 = self._safe_float(cur.get("ema200", close), close)
+        volume = self._safe_float(cur.get("volume", 0), 0)
+        volume_ma = self._safe_float(cur.get("volume_ma20", 0), 0)
+        volume_ratio = (volume / volume_ma) if volume_ma > 0 else 0
+
+        breakout_window = df["high"].iloc[-(self.sol_breakout_lookback + 2):-2]
+        breakout_level = self._safe_float(breakout_window.max(), close) if len(breakout_window) > 0 else close
+        breakout_above = bool(close > breakout_level and high >= breakout_level)
+        retest_band = max(atr * self.sol_retest_atr_tolerance, close * 0.0015)
+        retest_ok_sol = (
+            breakout_above
+            and low <= (breakout_level + retest_band)
+            and close >= breakout_level
+            and abs(close - breakout_level) <= max(retest_band * 1.4, close * 0.01)
+        )
+
+        swing_window = df.iloc[-(self.ada_range_lookback + 2):-2]
+        swing_high = self._safe_float(swing_window["high"].max(), close) if len(swing_window) > 0 else close
+        swing_low = self._safe_float(swing_window["low"].min(), close) if len(swing_window) > 0 else close
+        range_width = max(0.0, swing_high - swing_low)
+        range_position = ((close - swing_low) / range_width) if range_width > 0 else 0.5
+        middle_zone = 0.40 <= range_position <= 0.60
+        range_bounce = close >= prev_close
+        ada_in_lower_zone = bool(range_position <= self.ada_entry_lower_pct)
+        ada_target_price = swing_low + (range_width * self.ada_take_profit_upper_pct)
+
+        tr_atr_ratio = (tr / atr) if atr > 0 else 0.0
+        atr_pct = (atr / close) * 100 if close > 0 else 0.0
+        range_width_pct = (range_width / close) * 100 if close > 0 else 0.0
+
+        if close > ema50 > ema200:
+            structure = "BULL"
+        elif close < ema50 < ema200:
+            structure = "BEAR"
+        else:
+            structure = "RANGE"
+
+        pullback_to_ema20 = abs(close - ema20) <= max(atr * self.doge_pullback_atr_tolerance, close * 0.0025)
+        volatility_ok = tr_atr_ratio <= self.volatility_tr_atr_max
+        trend_bias_pct = ((ema50 / ema200) - 1.0) * 100.0 if ema200 > 0 else 0.0
+
+        quality_score = 0.0
+        quality_score += 20.0 if volatility_ok else -20.0
+        quality_score += min(18.0, max(0.0, volume_ratio * 9.0))
+        quality_score += 10.0 if breakout_above else 0.0
+        quality_score += 8.0 if retest_ok_sol else 0.0
+        quality_score += 8.0 if pullback_to_ema20 else 0.0
+        quality_score += 10.0 if ada_in_lower_zone else 0.0
+        quality_score += 8.0 if range_bounce else 0.0
+
+        return {
+            "ticker": ticker,
+            "candle_ts": str(getattr(cur, "name", "") or ""),
+            "close": float(close),
+            "prev_close": float(prev_close),
+            "high": float(high),
+            "low": float(low),
+            "ema20": float(ema20),
+            "ema50": float(ema50),
+            "ema200": float(ema200),
+            "rsi": float(rsi),
+            "atr": float(atr),
+            "atr_pct": float(atr_pct),
+            "tr": float(tr),
+            "tr_atr_ratio": float(tr_atr_ratio),
+            "volume_ratio": float(volume_ratio),
+            "breakout_level": float(breakout_level),
+            "swing_high": float(swing_high),
+            "swing_low": float(swing_low),
+            "range_width_pct": float(range_width_pct),
+            "range_position": float(max(0.0, min(1.0, range_position))),
+            "middle_zone": bool(middle_zone),
+            "range_clarity": bool(structure == "RANGE"),
+            "retest_ok_bull": bool(retest_ok_sol),
+            "retest_ok_sol": bool(retest_ok_sol),
+            "breakout_above_48": bool(breakout_above),
+            "near_lower_extreme": bool(ada_in_lower_zone),
+            "range_bounce": bool(range_bounce),
+            "volatility_ok": bool(volatility_ok),
+            "structure": structure,
+            "symbol_regime": structure,
+            "trend_bias_pct": float(trend_bias_pct),
+            "pullback_to_ema20": bool(pullback_to_ema20),
+            "ada_in_lower_zone": bool(ada_in_lower_zone),
+            "ada_target_price": float(ada_target_price),
+            "quality_score": float(quality_score),
+        }
+
+    def select_strategy(self, symbol_state, global_regime=None):
+        regime = str(global_regime or self.global_regime)
+        if not symbol_state:
+            return None
+
+        symbol = self._symbol(symbol_state.get("ticker"))
+        if symbol == "SOL":
+            return "SOL_TREND" if regime == "BULL" else None
+        if symbol == "DOGE":
+            return "DOGE_MOMENTUM"
+        if symbol == "ADA":
+            return "ADA_RANGE" if regime == "RANGE" else None
+        return None
+
+    def check_buy_signal(self, ticker):
+        """스펙 기반 매수 시그널 판단."""
+        try:
+            regime, _ = self.update_global_regime(force=False)
+            state = self.analyze_symbol(ticker)
+            if not state:
                 return False, ["데이터부족"], None, 0, {"blocked_by": ["데이터부족"]}
 
-            df = self.calculate_indicators(df)
-            df['ema_fast'] = df['close'].ewm(span=self.entry_ma_fast, adjust=False).mean()
-            df['ema_slow'] = df['close'].ewm(span=self.entry_ma_slow, adjust=False).mean()
-
-            current = df.iloc[-2]  # 확정 봉
-            prev = df.iloc[-3]
-            candle_ts = str(getattr(current, "name", "") or "")
-
-            if pd.isna(current.get('rsi')) or pd.isna(current.get('volume_ma')) or float(current.get('volume_ma', 0) or 0) <= 0:
-                return False, ["지표부족"], float(current.get('close', 0) or 0), 0, {
-                    "blocked_by": ["지표부족"],
-                    "candle_ts": candle_ts,
-                }
-
-            price = float(current.get('close', 0) or 0)
-            prev_price = float(prev.get('close', 0) or 0)
-            rsi_value = float(current.get('rsi', 0) or 0)
-            atr_value = float(current.get('atr', 0) or 0) if not pd.isna(current.get('atr')) else None
-            volume_ratio = float((current.get('volume', 0) or 0) / (current.get('volume_ma', 1) or 1))
-            macd_cross = bool(prev['macd'] <= prev['macd_signal'] and current['macd'] > current['macd_signal'])
-
-            breakout_window = df['high'].iloc[-(self.entry_breakout_lookback + 2):-2]
-            if breakout_window is None or len(breakout_window) < self.entry_breakout_lookback:
-                return False, ["돌파기준부족"], price, 0, {
-                    "blocked_by": ["돌파기준부족"],
-                    "candle_ts": candle_ts,
-                }
-
-            breakout_base = float(breakout_window.max())
-            breakout_price = breakout_base * (1 + self.entry_breakout_buffer)
-
-            trend_1m = bool(
-                (price > float(current.get('ema_fast', 0) or 0) > float(current.get('ema_slow', 0) or 0))
-                and (float(current.get('ema_fast', 0) or 0) >= float(prev.get('ema_fast', 0) or 0))
-            )
-            breakout_ok = bool(price > breakout_price)
-            volume_ok = bool(volume_ratio >= self.entry_volume_ratio_min)
-            rsi_ok = bool(self.entry_rsi_min <= rsi_value < self.entry_rsi_max)
-
-            # 상위 타임프레임 추세 확인
-            htf_count = max(140, self.htf_ma_slow + 60)
-            htf_df = self._get_cached_ohlcv(
-                ticker,
-                interval=self.htf_interval,
-                count=htf_count,
-                ttl_seconds=20,
-            )
-            if htf_df is None or len(htf_df) < (self.htf_ma_slow + 5):
-                return False, ["상위데이터부족"], price, 0, {
-                    "blocked_by": ["상위데이터부족"],
-                    "candle_ts": candle_ts,
-                    "volume_ratio": volume_ratio,
-                    "rsi": rsi_value,
-                }
-
-            htf_df['ema_fast'] = htf_df['close'].ewm(span=self.htf_ma_fast, adjust=False).mean()
-            htf_df['ema_slow'] = htf_df['close'].ewm(span=self.htf_ma_slow, adjust=False).mean()
-            htf_cur = htf_df.iloc[-2]
-            htf_prev = htf_df.iloc[-3]
-
-            htf_trend = bool(
-                float(htf_cur.get('close', 0) or 0) > float(htf_cur.get('ema_fast', 0) or 0) > float(htf_cur.get('ema_slow', 0) or 0)
-                and float(htf_cur.get('ema_fast', 0) or 0) >= float(htf_prev.get('ema_fast', 0) or 0)
-            )
-
+            strategy = self.select_strategy(state, regime)
             signals = []
             blocked_by = []
             score = 0
 
-            def add_block(reason):
+            def block(reason):
                 if reason not in blocked_by:
                     blocked_by.append(reason)
 
-            if trend_1m:
-                signals.append("1m추세상승")
-                score += 2
-            else:
-                add_block("1m추세약세")
+            if self._is_entry_time_blocked():
+                block("시간필터(02-06)")
 
-            if htf_trend:
-                signals.append(f"{self.htf_interval}추세상승")
-                score += 3
-            else:
-                add_block("상위추세약세")
+            btc_filter_passed, btc_filter_meta = self._check_btc_trend_filter()
+            if not btc_filter_passed:
+                block("BTC필터차단")
 
-            if breakout_ok:
-                signals.append(f"{self.entry_breakout_lookback}봉돌파")
-                score += 3
+            if state.get("tr_atr_ratio", 0) > self.volatility_tr_atr_max:
+                block("TR/ATR과열")
             else:
-                add_block("돌파실패")
-
-            if volume_ratio >= 2.0:
-                signals.append("거래량폭증")
-                score += 3
-            elif volume_ok:
-                signals.append("거래량증가")
-                score += 2
-            else:
-                add_block("거래량부족")
-
-            if rsi_ok:
-                signals.append(f"RSI적정({rsi_value:.1f})")
                 score += 1
+
+            if strategy is None:
+                block("레짐전략불일치")
             else:
-                add_block("RSI범위이탈")
+                signals.append(f"레짐:{regime}")
+                signals.append(f"전략:{strategy}")
+                score += 2
 
-            price_above_ma20 = not pd.isna(current.get('ma20')) and price > float(current.get('ma20', 0) or 0)
-            if self.require_price_above_ma20 and not price_above_ma20:
-                add_block("가격<MA20")
+            entry_price = state["close"]
+            stop_price = None
+            take_profit_price = None
+            time_stop_candles = self.time_stop_candles
+            target_r = None
 
-            if self.require_strong_trigger and (not volume_ok) and (not macd_cross):
-                add_block("강한트리거없음")
+            if strategy == "SOL_TREND":
+                if not state.get("breakout_above_48"):
+                    block("SOL48고점돌파미충족")
+                else:
+                    score += 2
+                    signals.append("48봉돌파")
 
+                if not state.get("retest_ok_sol"):
+                    block("SOL리테스트미충족")
+                else:
+                    score += 2
+                    signals.append("리테스트")
+
+                stop_price = entry_price - (self.sol_stop_atr * state.get("atr", 0))
+                target_r = self.sol_partial_tp_r
+
+            elif strategy == "DOGE_MOMENTUM":
+                if state.get("volume_ratio", 0) < self.doge_volume_spike_min:
+                    block("DOGE거래량스파이크미충족")
+                else:
+                    score += 2
+                    signals.append("거래량스파이크")
+
+                if state.get("rsi", 0) <= self.doge_rsi_min:
+                    block("DOGERSI미충족")
+                else:
+                    score += 1
+                    signals.append(f"RSI>{self.doge_rsi_min:.0f}")
+
+                if not state.get("pullback_to_ema20"):
+                    block("EMA20풀백미충족")
+                else:
+                    score += 2
+                    signals.append("EMA20풀백")
+
+                stop_price = entry_price * (1.0 - self.doge_stop_pct)
+                time_stop_candles = self.doge_time_stop_candles
+                target_r = self.doge_target_r
+
+            elif strategy == "ADA_RANGE":
+                if state.get("rsi", 100) > self.ada_rsi_max:
+                    block("ADARSI과매도미충족")
+                else:
+                    score += 1
+                    signals.append(f"RSI<={self.ada_rsi_max:.0f}")
+
+                if not state.get("ada_in_lower_zone"):
+                    block("ADA하단15%미충족")
+                else:
+                    score += 2
+                    signals.append("하단15%")
+
+                stop_price = entry_price * (1.0 - self.ada_stop_pct)
+                take_profit_price = state.get("ada_target_price")
+
+            if strategy and (not stop_price or stop_price <= 0 or stop_price >= entry_price):
+                block("손절가산출실패")
+                stop_price = entry_price * (1.0 + min(self.stop_loss, -0.004))
+
+            if strategy:
+                sizing = self._size_by_risk(ticker, entry_price, stop_price or entry_price)
+            else:
+                sizing = {
+                    "equity_krw": 0.0,
+                    "risk_krw": 0.0,
+                    "risk_pct": 0.0,
+                    "qty_by_risk": 0.0,
+                    "risk_invest_krw": 0.0,
+                    "weight_cap_krw": 0.0,
+                    "weight_remaining_krw": 0.0,
+                    "total_cap_remaining_krw": 0.0,
+                    "recommended_invest_krw": 0.0,
+                }
+            min_trade = float(self.config.get("trading", {}).get("min_trade_amount", 5500))
+            if strategy and sizing["recommended_invest_krw"] < min_trade:
+                block("리스크사이징최소금액미달")
+
+            if score < 3:
+                block("점수부족")
+
+            risk_unit = max(0.0, entry_price - stop_price) if stop_price else 0.0
             meta = {
                 "ticker": ticker,
                 "strategy_mode": self.strategy_mode,
-                "entry_interval": self.entry_interval,
-                "htf_interval": self.htf_interval,
-                "candle_ts": candle_ts,
-                "close": price,
-                "prev_close": prev_price,
-                "rsi": rsi_value,
-                "atr": float(atr_value) if atr_value is not None else None,
-                "atr_pct": (float(atr_value) / price * 100) if (atr_value is not None and price > 0) else None,
-                "volume_ratio": float(volume_ratio),
-                "macd_golden_cross": bool(macd_cross),
-                "breakout_base": float(breakout_base),
-                "breakout_price": float(breakout_price),
-                "trend_1m": bool(trend_1m),
-                "trend_htf": bool(htf_trend),
-                "price_above_ma20": bool(price_above_ma20),
-                "filters": {
-                    "entry_breakout_lookback": int(self.entry_breakout_lookback),
-                    "entry_breakout_buffer_pct": float(self.entry_breakout_buffer * 100),
-                    "entry_volume_ratio_min": float(self.entry_volume_ratio_min),
-                    "entry_rsi_min": float(self.entry_rsi_min),
-                    "entry_rsi_max": float(self.entry_rsi_max),
-                    "entry_ma_fast": int(self.entry_ma_fast),
-                    "entry_ma_slow": int(self.entry_ma_slow),
-                    "htf_ma_fast": int(self.htf_ma_fast),
-                    "htf_ma_slow": int(self.htf_ma_slow),
-                    "entry_min_score": int(self.entry_min_score),
-                },
-                "blocked_by": list(blocked_by),
+                "global_regime": regime,
+                "symbol_regime": state.get("symbol_regime"),
+                "strategy": strategy,
+                "candle_ts": state["candle_ts"],
+                "close": float(entry_price),
+                "rsi": float(state["rsi"]),
+                "atr": float(state["atr"]),
+                "atr_pct": float(state["atr_pct"]),
+                "tr_atr_ratio": float(state.get("tr_atr_ratio", 0)),
+                "volume_ratio": float(state["volume_ratio"]),
+                "range_position": float(state["range_position"]),
+                "middle_zone": bool(state["middle_zone"]),
+                "breakout_level": float(state["breakout_level"]),
+                "swing_low": float(state["swing_low"]),
+                "swing_high": float(state["swing_high"]),
+                "stop_price": float(stop_price) if stop_price else None,
+                "take_profit_price": float(take_profit_price) if take_profit_price else None,
+                "time_stop_candles": int(time_stop_candles),
+                "risk_unit": float(risk_unit),
+                "target_r": float(target_r) if target_r is not None else None,
+                "risk_per_trade_pct": float(sizing.get("risk_pct", 0)),
+                "btc_filter": btc_filter_meta,
                 "signals": list(signals),
                 "score": int(score),
+                "quality_score": float(state.get("quality_score", 0.0)),
+                "blocked_by": list(blocked_by),
             }
+            if strategy == "SOL_TREND":
+                meta.update(
+                    {
+                        "tp1_r": float(self.sol_partial_tp_r),
+                        "trail_activate_r": float(self.sol_trailing_activate_r),
+                        "sol_trailing_stop_pct": float(self.sol_trailing_stop_pct),
+                    }
+                )
+            elif strategy == "DOGE_MOMENTUM":
+                meta.update(
+                    {
+                        "target_r": float(self.doge_target_r),
+                        "time_stop_candles": int(self.doge_time_stop_candles),
+                    }
+                )
+            elif strategy == "ADA_RANGE":
+                meta.update(
+                    {
+                        "take_profit_price": float(take_profit_price) if take_profit_price else None,
+                    }
+                )
+            meta.update(sizing)
 
             if blocked_by:
-                self.logger.debug(f"  {ticker} ❌ 매수 차단: {', '.join(blocked_by)}")
-                return False, signals, price, score, meta
+                return False, signals, entry_price, score, meta
 
-            if score < self.entry_min_score:
-                meta["blocked_by"] = ["점수부족"]
-                self.logger.debug(f"  {ticker} ❌ 점수 부족 ({score}점 < {self.entry_min_score}점)")
-                return False, signals, price, score, meta
-
-            self.logger.info(f"  {ticker} ✅ 매수 조건 충족! (점수: {score}점)")
-            return True, signals, price, score, meta
+            return True, signals, entry_price, score, meta
 
         except Exception as e:
             self.logger.log_error(f"{ticker} 매수 신호 확인 오류", e)
             return False, [], None, 0, {"blocked_by": ["예외"], "error": f"{type(e).__name__}: {e}"}
-    
+
     def check_sell_signal(self, ticker, position):
-        """매도 신호 확인"""
-        
+        """전략별 청산 시그널 판단."""
         try:
-            df = self._get_cached_ohlcv(ticker, interval="minute1", count=260, ttl_seconds=2)
-            if df is None:
-                return False, "HOLD", 1.0, {"blocked_by": ["데이터없음"]}
-            
-            df = self.calculate_indicators(df)
-            df['ema_fast'] = df['close'].ewm(span=self.entry_ma_fast, adjust=False).mean()
-            df['ema_slow'] = df['close'].ewm(span=self.entry_ma_slow, adjust=False).mean()
-
-            # 확정 봉 기반 지표(노이즈로 인한 잦은 매도 방지)
-            current = df.iloc[-2]
-            prev = df.iloc[-3]
-
-            current_price = pyupbit.get_current_price(ticker)
+            state = self.analyze_symbol(ticker)
+            current_price = self.get_current_price(ticker)
+            if current_price is None and state:
+                current_price = state.get("close")
             if current_price is None:
-                try:
-                    current_price = float(df.iloc[-1].get("close", current.get("close", 0)) or current.get("close", 0))
-                except Exception:
-                    current_price = float(current.get("close", 0) or 0)
+                return False, "HOLD", 1.0, {"blocked_by": ["가격조회실패"]}
 
-            buy_price = position['buy_price']
-            highest_price = position['highest_price']
-            current_atr = current['atr']
-            hold_minutes = 0.0
-            try:
-                hold_minutes = (datetime.now() - position['timestamp']).total_seconds() / 60.0
-            except Exception:
-                hold_minutes = 0.0
-            
-            # 최고가 업데이트
+            buy_price = self._safe_float(position.get("buy_price", 0), 0)
+            if buy_price <= 0:
+                return False, "HOLD", 1.0, {"blocked_by": ["매수가없음"]}
+
+            highest_price = self._safe_float(position.get("highest_price", buy_price), buy_price)
             if current_price > highest_price:
                 highest_price = current_price
                 self.stats.update_position_highest(ticker, highest_price)
-            
+
+            hold_minutes = 0.0
+            try:
+                hold_minutes = (datetime.now() - position["timestamp"]).total_seconds() / 60.0
+            except Exception:
+                hold_minutes = 0.0
+
+            buy_meta = position.get("buy_meta", {}) if isinstance(position.get("buy_meta"), dict) else {}
+            strategy = buy_meta.get("strategy")
+            stop_price = self._safe_float(buy_meta.get("stop_price", 0), 0)
+            if stop_price <= 0:
+                stop_price = buy_price * (1 + self.stop_loss)
+
             profit_rate = (current_price - buy_price) / buy_price
+            risk_unit = max(1e-8, buy_price - stop_price)
+            progress_r = (current_price - buy_price) / risk_unit
+            hold_candles = hold_minutes / max(1, self.signal_candle_minutes)
 
             meta = {
                 "ticker": ticker,
-                "interval": "minute1",
                 "current_price": float(current_price),
-                "indicator_close": float(current.get("close", 0) or 0),
                 "buy_price": float(buy_price),
                 "highest_price": float(highest_price),
                 "profit_rate": float(profit_rate),
-                "rsi": float(current.get("rsi", 0) or 0) if not pd.isna(current.get("rsi")) else None,
-                "bb_lower": float(current.get("bb_lower", 0) or 0) if not pd.isna(current.get("bb_lower")) else None,
-                "bb_upper": float(current.get("bb_upper", 0) or 0) if not pd.isna(current.get("bb_upper")) else None,
-                "atr": float(current_atr) if not pd.isna(current_atr) else None,
                 "hold_minutes": float(hold_minutes),
-                "sold_ratio": None,
-                "reason": None,
+                "hold_candles": float(hold_candles),
+                "strategy": strategy,
+                "global_regime": self.global_regime,
+                "stop_price": float(stop_price),
+                "risk_unit": float(risk_unit),
+                "progress_r": float(progress_r),
             }
-            
-            # 이미 매도한 비율 계산
-            original_amount = position.get('original_amount', position['amount'])
-            current_amount = position['amount']
-            sold_ratio = 1.0 - (current_amount / original_amount) if original_amount > 0 else 0
-            meta["sold_ratio"] = float(sold_ratio)
 
-            # 손절 기준: 고정 손절 + ATR 손절 중 더 넓은(덜 타이트한) 값 사용
-            effective_stop_rate = float(self.stop_loss)
-            atr_stop_rate = None
-            if self.use_atr and not pd.isna(current_atr) and current_atr > 0 and buy_price > 0:
-                atr_stop_rate = -((current_atr * self.atr_sl_multiplier) / buy_price)
-                if self.min_atr_stop_loss is not None:
-                    atr_stop_rate = min(atr_stop_rate, self.min_atr_stop_loss)
-                effective_stop_rate = min(float(self.stop_loss), float(atr_stop_rate))
-
-            meta["effective_stop_rate"] = float(effective_stop_rate)
-            if atr_stop_rate is not None:
-                meta["atr_stop_rate"] = float(atr_stop_rate)
-
-            if profit_rate <= effective_stop_rate:
-                reason = f"손절({profit_rate*100:.2f}%)"
+            if current_price <= stop_price:
+                reason = f"구조손절({profit_rate*100:.2f}%)"
                 meta["reason"] = reason
+                meta["r_multiple"] = float(progress_r)
                 return True, reason, 1.0, meta
 
-            # 트레일링: 수익 구간에서만 작동
-            if profit_rate >= self.trailing_activation and highest_price > 0:
-                trailing_drawdown = (current_price - highest_price) / highest_price
-                meta["trailing_drawdown"] = float(trailing_drawdown)
-                if trailing_drawdown <= -self.trailing_stop:
-                    reason = f"트레일링({profit_rate*100:.2f}%)"
-                    meta["reason"] = reason
-                    return True, reason, 1.0, meta
-
-            # 최소 보유 시간 이전에는 소프트 청산 금지(과매매/수수료 드래그 억제)
-            if hold_minutes < self.min_hold_minutes:
-                meta["blocked_by"] = ["min_hold"]
-                return False, "HOLD", 1.0, meta
-
-            # 추세 이탈 청산 (1분 + 상위 타임프레임)
-            ema_fast = float(current.get('ema_fast', 0) or 0)
-            ema_slow = float(current.get('ema_slow', 0) or 0)
-            trend_break_1m = bool(current_price < ema_fast and ema_fast < ema_slow)
-
-            htf_break = False
-            htf_df = self._get_cached_ohlcv(
-                ticker,
-                interval=self.htf_interval,
-                count=max(140, self.htf_ma_slow + 60),
-                ttl_seconds=20,
-            )
-            if htf_df is not None and len(htf_df) >= (self.htf_ma_slow + 5):
-                htf_df['ema_fast'] = htf_df['close'].ewm(span=self.htf_ma_fast, adjust=False).mean()
-                htf_df['ema_slow'] = htf_df['close'].ewm(span=self.htf_ma_slow, adjust=False).mean()
-                htf_cur = htf_df.iloc[-2]
-                htf_break = bool(
-                    float(htf_cur.get('close', 0) or 0) < float(htf_cur.get('ema_fast', 0) or 0)
-                    or float(htf_cur.get('ema_fast', 0) or 0) < float(htf_cur.get('ema_slow', 0) or 0)
+            if strategy == "SOL_TREND":
+                tp1_done = bool(buy_meta.get("sol_tp1_done", False))
+                tp1_r = self._safe_float(buy_meta.get("tp1_r", self.sol_partial_tp_r), self.sol_partial_tp_r)
+                trail_activate_r = self._safe_float(
+                    buy_meta.get("trail_activate_r", self.sol_trailing_activate_r),
+                    self.sol_trailing_activate_r,
+                )
+                trailing_pct = self._safe_float(
+                    buy_meta.get("sol_trailing_stop_pct", self.sol_trailing_stop_pct),
+                    self.sol_trailing_stop_pct,
                 )
 
-            rsi_break = False
-            if not pd.isna(current.get('rsi')):
-                rsi_break = bool(float(current.get('rsi', 0) or 0) < max(45.0, self.entry_rsi_min - 8.0))
+                if (not tp1_done) and progress_r >= tp1_r:
+                    buy_meta["sol_tp1_done"] = True
+                    buy_meta["tp1_executed_at"] = datetime.now().isoformat()
+                    self._persist_position_meta(ticker, position, buy_meta)
+                    reason = f"SOL 1차익절({progress_r:.2f}R)"
+                    meta["reason"] = reason
+                    meta["r_multiple"] = float(progress_r)
+                    return True, reason, 0.30, meta
 
-            meta["trend_break_1m"] = bool(trend_break_1m)
-            meta["trend_break_htf"] = bool(htf_break)
-            meta["rsi_break"] = bool(rsi_break)
+                trailing_active = bool(buy_meta.get("sol_trailing_active", False))
+                if (not trailing_active) and progress_r >= trail_activate_r:
+                    trailing_active = True
+                    buy_meta["sol_trailing_active"] = True
+                    buy_meta["sol_trailing_stop_price"] = float(
+                        max(stop_price, highest_price * (1.0 - trailing_pct))
+                    )
+                    buy_meta["sol_trailing_started_at"] = datetime.now().isoformat()
+                    self._persist_position_meta(ticker, position, buy_meta)
 
-            if trend_break_1m and (htf_break or rsi_break):
-                reason = f"추세이탈({profit_rate*100:.2f}%)"
+                if trailing_active:
+                    prev_trailing = self._safe_float(
+                        buy_meta.get("sol_trailing_stop_price", stop_price),
+                        stop_price,
+                    )
+                    new_trailing = max(prev_trailing, highest_price * (1.0 - trailing_pct))
+                    if new_trailing > prev_trailing * 1.000001:
+                        buy_meta["sol_trailing_stop_price"] = float(new_trailing)
+                        self._persist_position_meta(ticker, position, buy_meta)
+
+                    meta["trailing_stop_price"] = float(new_trailing)
+                    if current_price <= new_trailing:
+                        reason = f"SOL 트레일링청산({progress_r:.2f}R)"
+                        meta["reason"] = reason
+                        meta["r_multiple"] = float(progress_r)
+                        return True, reason, 1.0, meta
+
+            elif strategy == "DOGE_MOMENTUM":
+                target_r = self._safe_float(buy_meta.get("target_r", self.doge_target_r), self.doge_target_r)
+                time_stop_candles = int(
+                    self._safe_float(
+                        buy_meta.get("time_stop_candles", self.doge_time_stop_candles),
+                        self.doge_time_stop_candles,
+                    )
+                )
+                meta["target_r"] = float(target_r)
+                meta["time_stop_candles"] = int(time_stop_candles)
+
+                if progress_r >= target_r:
+                    reason = f"DOGE 목표도달({progress_r:.2f}R)"
+                    meta["reason"] = reason
+                    meta["r_multiple"] = float(progress_r)
+                    return True, reason, 1.0, meta
+
+                if hold_candles >= time_stop_candles and progress_r < target_r:
+                    reason = f"DOGE 시간청산({hold_candles:.1f}캔들,{progress_r:.2f}R)"
+                    meta["reason"] = reason
+                    meta["r_multiple"] = float(progress_r)
+                    return True, reason, 1.0, meta
+
+            elif strategy == "ADA_RANGE":
+                target_price = self._safe_float(buy_meta.get("take_profit_price", 0), 0)
+                if target_price > 0:
+                    meta["take_profit_price"] = float(target_price)
+                    if current_price >= target_price:
+                        reason = f"ADA 목표청산({progress_r:.2f}R)"
+                        meta["reason"] = reason
+                        meta["r_multiple"] = float(progress_r)
+                        return True, reason, 1.0, meta
+
+            if state:
+                meta["symbol_regime"] = state.get("symbol_regime")
+                meta["range_position"] = float(state.get("range_position", 0.5))
+                meta["rsi"] = float(state.get("rsi", 50))
+                meta["tr_atr_ratio"] = float(state.get("tr_atr_ratio", 0))
+
+            if self.max_hold_minutes > 0 and hold_minutes >= self.max_hold_minutes:
+                reason = f"최대보유청산({hold_minutes:.0f}m,{profit_rate*100:.2f}%)"
                 meta["reason"] = reason
+                meta["r_multiple"] = float(progress_r)
                 return True, reason, 1.0, meta
 
-            # 최대 보유 시간 도달 시 수익 보호 또는 약세 시 정리
-            if self.max_hold_minutes > 0 and hold_minutes >= self.max_hold_minutes:
-                if profit_rate > 0 or trend_break_1m:
-                    reason = f"시간청산({hold_minutes:.0f}m,{profit_rate*100:.2f}%)"
-                    meta["reason"] = reason
-                    return True, reason, 1.0, meta
-
-            # 과열 익절 (분할 익절 기본 비활성)
-            if self.use_partial_take_profit:
-                if profit_rate >= self.take_profit_1 and sold_ratio < 0.1:
-                    reason = f"1차익절({profit_rate*100:.2f}%)"
-                    meta["reason"] = reason
-                    return True, reason, self.config['risk_management']['take_profit_1_ratio'], meta
-
-                if profit_rate >= self.take_profit_2 and sold_ratio >= 0.4 and sold_ratio < 0.7:
-                    reason = f"2차익절({profit_rate*100:.2f}%)"
-                    meta["reason"] = reason
-                    return True, reason, self.config['risk_management']['take_profit_2_ratio'], meta
-            else:
-                if (
-                    profit_rate >= self.take_profit_2
-                    and not pd.isna(current.get('rsi'))
-                    and float(current.get('rsi', 0) or 0) >= 78
-                ):
-                    reason = f"과열익절({profit_rate*100:.2f}%)"
-                    meta["reason"] = reason
-                    return True, reason, 1.0, meta
-
             return False, "HOLD", 1.0, meta
-            
+
         except Exception as e:
             self.logger.log_error(f"{ticker} 매도 신호 확인 오류", e)
             return False, "ERROR", 1.0, {"blocked_by": ["예외"], "error": f"{type(e).__name__}: {e}"}
@@ -1118,6 +1551,8 @@ class TradingEngine:
     def get_balance(self, currency="KRW"):
         """잔고 조회"""
         try:
+            if self.upbit is None:
+                return 0.0
             value = self.upbit.get_balance(currency)
             if value is None:
                 return 0.0
@@ -1145,6 +1580,8 @@ class TradingEngine:
             float: 매도 가능한 실제 수량 (locked 제외)
         """
         try:
+            if self.upbit is None:
+                return 0.0
             coin = ticker.split('-')[1]
             balances = self.upbit.get_balances()
             

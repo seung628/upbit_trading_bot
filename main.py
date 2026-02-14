@@ -28,8 +28,8 @@ class TradingBot:
         # 모듈 초기화
         self.logger = TradingLogger(self.config)
         self.stats = TradingStats()
-        self.coin_selector = CoinSelector(self.config, self.logger)
         self.engine = TradingEngine(self.config, self.logger, self.stats)
+        self.coin_selector = CoinSelector(self.config, self.logger, self.engine)
         self.telegram = TelegramNotifier(self.config)
         self.bot_name = BOT_NAME
         self.bot_display_name = BOT_DISPLAY_NAME
@@ -48,15 +48,13 @@ class TradingBot:
         self.buy_lock = threading.Lock()  # 매수 Lock
         
         # 설정값
-        self.max_coins = self.config['trading']['max_coins']
-        self.buy_amount_krw = self.config['trading']['buy_amount_krw']
-        self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
-        self.dynamic_allocation = self.config['trading'].get('dynamic_allocation', False)
         try:
-            mpr = float(self.config['trading'].get('max_position_ratio', 0.45))
-            self.max_position_ratio = max(0.10, min(1.0, mpr))
+            requested_max = int(self.config['trading'].get('max_coins', 3))
         except Exception:
-            self.max_position_ratio = 0.45
+            requested_max = 3
+        engine_max = int(getattr(self.engine, "max_positions", requested_max) or requested_max)
+        self.max_coins = max(1, min(requested_max, engine_max))
+        self.max_total_investment = self.config['trading'].get('max_total_investment', 300000)
         _auto = self.config['trading'].get('auto_start_on_launch', True)
         self.auto_start_on_launch = True if _auto is None else bool(_auto)
         self.check_interval = self.config['trading']['check_interval_seconds']
@@ -65,6 +63,13 @@ class TradingBot:
         self.empty_list_retry_max_seconds = self.config['coin_selection'].get('empty_list_retry_max_seconds', 600)
         self._empty_list_fail_count = 0
         self.last_buy_attempt_candle = {}  # ticker -> candle_ts
+        self._last_buy_block_signature = {}  # ticker -> dedupe signature
+        try:
+            hb = int(self.config['trading'].get('analysis_heartbeat_minutes', 10))
+            self.analysis_heartbeat_minutes = max(1, hb)
+        except Exception:
+            self.analysis_heartbeat_minutes = 10
+        self._last_analysis_heartbeat_at = None
         
         # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
         try:
@@ -167,6 +172,13 @@ class TradingBot:
         )
         self.stats.start(initial_balance, initial_total_value=initial_total_value)
         
+        # 초기 레짐 계산
+        try:
+            regime, _ = self.engine.update_global_regime(force=True)
+            self.logger.info(f"🌐 초기 글로벌 레짐: {regime}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ 초기 레짐 계산 실패: {e}")
+
         # 코인 선정
         self.target_coins = self.coin_selector.get_top_coins(self.max_coins)
         self.last_coin_refresh = datetime.now()
@@ -183,25 +195,39 @@ class TradingBot:
                 "initial_positions_value_krw": float(positions_value),
                 "recovered_positions": list(self.stats.positions.keys()),
                 "selected_coins": list(self.target_coins),
+                "global_regime": getattr(self.engine, "global_regime", "RANGE"),
                 "protected_coins": sorted(list(self.protected_coins)),
                 "config": {
                     "max_coins": int(self.max_coins),
                     "check_interval_seconds": float(self.check_interval),
-                    "use_signal_scoring": bool(self.config.get("indicators", {}).get("use_signal_scoring", False)),
-                    "min_signal_score": int(self.config.get("indicators", {}).get("min_signal_score", 7) or 7),
-                    "rsi_buy_min": float(self.config.get("indicators", {}).get("rsi_buy_min", 50) or 50),
-                    "rsi_buy_max": float(self.config.get("indicators", {}).get("rsi_buy_max", 70) or 70),
-                    "require_price_above_ma20": (
-                        True
-                        if self.config.get("indicators", {}).get("require_price_above_ma20", True) is None
-                        else bool(self.config.get("indicators", {}).get("require_price_above_ma20", True))
-                    ),
-                    "require_strong_trigger": (
-                        True
-                        if self.config.get("indicators", {}).get("require_strong_trigger", True) is None
-                        else bool(self.config.get("indicators", {}).get("require_strong_trigger", True))
-                    ),
-                    "strong_trigger_min_volume_ratio": float(self.config.get("indicators", {}).get("strong_trigger_min_volume_ratio", 1.8) or 1.8),
+                    "refresh_interval_hours": float(self.refresh_interval_hours),
+                    "analysis_heartbeat_minutes": int(self.analysis_heartbeat_minutes),
+                    "max_total_investment_krw": float(self.max_total_investment),
+                    "strategy": {
+                        "mode": self.config.get("strategy", {}).get("mode", "regime"),
+                        "entry_interval": self.config.get("strategy", {}).get("entry_interval", "minute5"),
+                        "signal_candle_minutes": int(self.config.get("strategy", {}).get("signal_candle_minutes", 20) or 20),
+                        "regime_reference": self.config.get("strategy", {}).get("regime_reference", "KRW-BTC"),
+                        "regime_check_minutes": int(self.config.get("strategy", {}).get("regime_check_minutes", 20) or 20),
+                        "regime_confirm_count": int(self.config.get("strategy", {}).get("regime_confirm_count", 3) or 3),
+                        "regime_min_hold_minutes": int(self.config.get("strategy", {}).get("regime_min_hold_minutes", 0) or 0),
+                        "universe": list(self.config.get("strategy", {}).get("universe", []) or []),
+                        "entry_time_filter": dict(self.config.get("strategy", {}).get("entry_time_filter", {}) or {}),
+                        "btc_filter": dict(self.config.get("strategy", {}).get("btc_filter", {}) or {}),
+                        "volatility_tr_atr_max": float(self.config.get("strategy", {}).get("volatility_tr_atr_max", 3.0) or 3.0),
+                        "risk_per_symbol_pct": dict(self.config.get("strategy", {}).get("risk_per_symbol_pct", {}) or {}),
+                        "fixed_tickers": list(self.config.get("coin_selection", {}).get("fixed_tickers", []) or []),
+                        "excluded_coins": list(self.config.get("coin_selection", {}).get("excluded_coins", []) or []),
+                    },
+                    "risk_management": {
+                        "risk_per_trade_pct": float(self.config.get("risk_management", {}).get("risk_per_trade_pct", 1.0) or 1.0),
+                        "risk_per_symbol_pct": dict(self.config.get("risk_management", {}).get("risk_per_symbol_pct", {}) or {}),
+                        "time_stop_candles": int(self.config.get("risk_management", {}).get("time_stop_candles", 10) or 10),
+                        "min_hold_minutes": int(self.config.get("risk_management", {}).get("min_hold_minutes", 20) or 20),
+                        "max_hold_minutes": int(self.config.get("risk_management", {}).get("max_hold_minutes", 360) or 360),
+                        "trailing_stop_pct": float(self.config.get("risk_management", {}).get("trailing_stop_pct", 1.0) or 1.0),
+                        "trailing_activation_pct": float(self.config.get("risk_management", {}).get("trailing_activation_pct", 2.0) or 2.0),
+                    },
                     "fee_pct": self.config.get("trading", {}).get("fee_pct", None),
                 },
             },
@@ -235,86 +261,77 @@ class TradingBot:
     
     def _print_trading_conditions(self):
         """현재 매수 조건 출력"""
-        
+
         print("\n" + "="*80)
         print("📋 현재 매수 조건")
         print("="*80)
-        
-        strategy_cfg = self.config.get('strategy', {})
-        mode = strategy_cfg.get('mode', 'trend_breakout')
-        entry_interval = strategy_cfg.get('entry_interval', 'minute1')
-        htf_interval = strategy_cfg.get('htf_interval', 'minute15')
-        breakout_lookback = strategy_cfg.get('entry_breakout_lookback', 20)
-        breakout_buffer = strategy_cfg.get('entry_breakout_buffer_pct', 0.05)
-        vol_min = strategy_cfg.get('entry_volume_ratio_min', 1.6)
-        rsi_min = strategy_cfg.get('entry_rsi_min', 52)
-        rsi_max = strategy_cfg.get('entry_rsi_max', 72)
-        entry_min_score = strategy_cfg.get('entry_min_score', 8)
-        entry_ma_fast = strategy_cfg.get('entry_ma_fast', 20)
-        entry_ma_slow = strategy_cfg.get('entry_ma_slow', 60)
-        htf_ma_fast = strategy_cfg.get('htf_ma_fast', 20)
-        htf_ma_slow = strategy_cfg.get('htf_ma_slow', 50)
+
+        strategy_cfg = self.config.get("strategy", {}) or {}
+        risk_cfg = self.config.get("risk_management", {}) or {}
+
+        mode = strategy_cfg.get("mode", "regime")
+        entry_interval = strategy_cfg.get("entry_interval", "minute20")
+        signal_candle_minutes = int(strategy_cfg.get("signal_candle_minutes", 20) or 20)
+        regime_check_minutes = strategy_cfg.get("regime_check_minutes", 20)
+        regime_confirm_count = strategy_cfg.get("regime_confirm_count", 3)
+        regime_min_hold_minutes = strategy_cfg.get("regime_min_hold_minutes", 0)
+        max_positions = strategy_cfg.get("max_positions", self.max_coins)
+        universe = strategy_cfg.get("universe", ["SOL", "DOGE", "ADA"])
+        no_entry = strategy_cfg.get("entry_time_filter", {}) or {}
+        btc_filter = strategy_cfg.get("btc_filter", {}) or {}
+        risk_per_symbol = strategy_cfg.get("risk_per_symbol_pct", {}) or risk_cfg.get("risk_per_symbol_pct", {}) or {}
 
         print("\n🎯 전략 모드")
-        print(f"  {mode} (비용 민감 추세 돌파)")
+        print(f"  {mode} (레짐이 전략을 결정)")
+        print(f"  현재 레짐: {getattr(self.engine, 'global_regime', 'RANGE')}")
+        print(f"  레짐 갱신 주기: {regime_check_minutes}분 | 기준 봉: {signal_candle_minutes}분")
+        print(f"  전환 확정: {regime_confirm_count}회 연속 (최소 유지 {regime_min_hold_minutes}분)")
 
-        print("\n📌 매수 핵심 조건")
-        print(f"  1) {entry_interval} 추세: 가격 > EMA{entry_ma_fast} > EMA{entry_ma_slow}")
-        print(f"  2) {htf_interval} 추세: 가격 > EMA{htf_ma_fast} > EMA{htf_ma_slow}")
-        print(f"  3) 최근 {breakout_lookback}봉 고점 돌파 (+{breakout_buffer}%)")
-        print(f"  4) 거래량 비율: {vol_min}배 이상")
-        print(f"  5) RSI 범위: {rsi_min} <= RSI < {rsi_max}")
-        print(f"  6) 진입 점수: {entry_min_score}점 이상")
+        print("\n📌 레짐별 전략")
+        print("  SOL: BULL 레짐에서 48봉 돌파+리테스트")
+        print("  DOGE: 거래량 스파이크 + RSI 모멘텀 + EMA20 풀백")
+        print("  ADA: RANGE 레짐에서 RSI 과매도 + 96봉 하단 15%")
 
-        print("\n📌 매도 핵심 조건")
-        min_hold = self.config.get('risk_management', {}).get('min_hold_minutes', 20)
-        max_hold = self.config.get('risk_management', {}).get('max_hold_minutes', 360)
-        use_partial_tp = self.config.get('risk_management', {}).get('use_partial_take_profit', False)
-        print(f"  1) 손절: 고정 손절/ATR 손절 중 더 완만한 기준")
-        print(f"  2) 트레일링: 수익 구간에서만 작동")
-        print(f"  3) 최소 보유: {min_hold}분 (과매매 억제)")
-        print(f"  4) 추세 이탈(1분+상위) 시 청산")
-        print(f"  5) 최대 보유: {max_hold}분")
-        print(f"  6) 분할 익절: {'ON' if use_partial_tp else 'OFF(기본 전량)'}")
-        
-        print("\n💰 투자 금액")
-        if self.config['trading'].get('dynamic_allocation', False):
-            print(f"  ✅ 동적 투자:")
-            print(f"     기본 금액: {self.config['trading']['buy_amount_krw']:,}원")
-            print(f"     최대 한도: {self.config['trading']['max_total_investment']:,}원")
-            print(f"     포지션당 상한: {self.max_position_ratio*100:.0f}%")
-            print(f"     운용: 한도 내 슬롯 기반 배분 + 점수 가중")
-            print(f"     점수 11점+: 강한 가중(우선 배분)")
-            print(f"     점수 9-10점: 중간 가중")
-            print(f"     점수 7-8점: 기본 배분")
-        else:
-            print(f"  고정 금액: {self.config['trading']['buy_amount_krw']:,}원")
-        
+        print("\n📌 공통 진입 게이트")
+        print(f"  1) 시간 필터: {no_entry.get('start_hour', 2):02d}:00~{no_entry.get('end_hour', 6):02d}:00 신규 진입 차단")
+        print(f"  2) BTC 필터: {btc_filter.get('ticker', 'KRW-BTC')} 종가 > EMA{btc_filter.get('ema_period', 50)}")
+        print(f"  3) 변동성 필터: TR/ATR <= {strategy_cfg.get('volatility_tr_atr_max', 3.0)}")
+        print("  4) 동시 포지션 최대 2개")
+
+        time_stop_candles = risk_cfg.get("time_stop_candles", 10)
+        risk_per_trade_pct = risk_cfg.get("risk_per_trade_pct", 1.0)
+        min_hold = risk_cfg.get("min_hold_minutes", 20)
+        max_hold = risk_cfg.get("max_hold_minutes", 360)
+
+        print("\n📌 손절/청산 핵심")
+        print("  1) SOL: 손절 0.5*ATR, 1.2R 30% 익절, 2.2R 이후 트레일링")
+        print("  2) DOGE: 손절 -0.8%, 6캔들 시간청산")
+        print("  3) ADA: 손절 -0.9%, 96봉 상단 85% 목표청산")
+        print(f"  4) 공통 최대보유: {max_hold}분 (기본 시간손절 {time_stop_candles}캔들)")
+
+        print("\n💰 자금 운용")
+        print(f"  최대 투자 한도: {self.max_total_investment:,.0f}원")
+        print(f"  최대 동시 포지션: {max_positions}개")
+        print(f"  기본 유니버스: {', '.join(universe)}")
+        print(f"  종목별 리스크(%): {risk_per_symbol if risk_per_symbol else risk_per_trade_pct}")
+        print("  사이징: 계좌 리스크/손절거리 기반 + 종목별 비중 상한")
+
         print("\n🛡️ 안전 장치")
         print(f"  최대 스프레드: {self.config['trading'].get('max_spread_percent', 0.5)}%")
         print(f"  최소 호가잔량: {self.config['trading'].get('min_orderbook_depth_krw', 5000000):,}원")
-        
+
         print("\n⏰ 거래 시간")
-        if self.config['trading']['trading_hours'].get('enabled', False):
-            sessions = self.config['trading']['trading_hours']['sessions']
-            print(f"  ✅ 시간 필터 사용:")
+        if self.config["trading"]["trading_hours"].get("enabled", False):
+            sessions = self.config["trading"]["trading_hours"]["sessions"]
+            print("  ✅ 시간 필터 사용:")
             for session in sessions:
                 print(f"     {session['start']:02d}:00 ~ {session['end']:02d}:00")
         else:
-            print(f"  ❌ 24시간 거래")
-        
-        print("\n🎲 코인 선정")
-        print(f"  최대 동시 거래: {self.config['trading']['max_coins']}개")
-        print(f"  최소 거래량: {self.config['coin_selection']['min_volume_krw']/100000000:.0f}억원")
-        print(f"  변동성 범위: {self.config['coin_selection']['min_volatility']}% ~ {self.config['coin_selection']['max_volatility']}%")
-        
-        excluded = self.config['coin_selection'].get('excluded_coins', [])
-        if excluded:
-            print(f"  제외 코인: {', '.join(excluded)}")
-        
+            print("  ❌ 24시간 거래")
+
         if self.protected_coins:
-            print(f"  보호 종목(미개입): {', '.join(sorted(self.protected_coins))}")
-        
+            print(f"\n🛡️ 보호 종목(미개입): {', '.join(sorted(self.protected_coins))}")
+
         print("="*80)
     
     def _to_symbol(self, ticker_or_symbol):
@@ -693,6 +710,16 @@ class TradingBot:
         losses = [t for t in today_trades if _paf(t) <= 0]
         total_fee_sum = buy_fee_sum + sell_fee_sum
         fee_turnover_str = f"{(total_fee_sum/turnover_krw*100):.3f}%" if turnover_krw > 0 else "N/A"
+        strategy_profit = {}
+        strategy_count = {}
+        strategy_wins = {}
+        for t in today_trades:
+            buy_meta = t.get("buy_meta", {}) if isinstance(t.get("buy_meta"), dict) else {}
+            strategy = str(t.get("strategy") or buy_meta.get("strategy") or "UNKNOWN")
+            strategy_profit[strategy] = strategy_profit.get(strategy, 0.0) + _paf(t)
+            strategy_count[strategy] = strategy_count.get(strategy, 0) + 1
+            if _paf(t) > 0:
+                strategy_wins[strategy] = strategy_wins.get(strategy, 0) + 1
         
         message = f"""📅 <b>일일 통계</b>
 
@@ -718,6 +745,15 @@ class TradingBot:
         if losses:
             worst = min(losses, key=_paf)
             message += f"\n📉 최악: {worst['coin'].replace('KRW-', '')} {_paf(worst):+,.0f}원"
+
+        if strategy_count:
+            message += "\n\n🧠 <b>전략별 성과</b>"
+            ranked = sorted(strategy_profit.items(), key=lambda kv: kv[1], reverse=True)
+            for strategy, pnl in ranked:
+                cnt = strategy_count.get(strategy, 0)
+                win = strategy_wins.get(strategy, 0)
+                wr = (win / cnt * 100) if cnt > 0 else 0
+                message += f"\n{strategy}: {pnl:+,.0f}원 ({cnt}회, 승률 {wr:.1f}%)"
         
         self.telegram.send_message(message)
 
@@ -813,8 +849,12 @@ class TradingBot:
             daily_profit[d] = 0
             daily_count[d] = 0
         
-        # 종목별 손익
+        # 종목/전략별 손익
         coin_profit = {}
+        strategy_stats = {}
+        strategy_profit = {}
+        strategy_count = {}
+        strategy_wins = {}
         
         for t in week_trades:
             d = t['timestamp'].date()
@@ -823,6 +863,21 @@ class TradingBot:
             
             coin = t['coin'].replace('KRW-', '')
             coin_profit[coin] = coin_profit.get(coin, 0) + _paf(t)
+            buy_meta = t.get('buy_meta', {}) if isinstance(t.get('buy_meta'), dict) else {}
+            strategy = str(t.get('strategy') or buy_meta.get('strategy') or 'UNKNOWN')
+            if strategy not in strategy_stats:
+                strategy_stats[strategy] = {'trades': 0, 'wins': 0, 'profit': 0.0}
+            strategy_stats[strategy]['trades'] += 1
+            paf_strategy = _paf(t)
+            strategy_stats[strategy]['profit'] += float(paf_strategy or 0)
+            if paf_strategy > 0:
+                strategy_stats[strategy]['wins'] += 1
+            buy_meta = t.get("buy_meta", {}) if isinstance(t.get("buy_meta"), dict) else {}
+            strategy = str(t.get("strategy") or buy_meta.get("strategy") or "UNKNOWN")
+            strategy_profit[strategy] = strategy_profit.get(strategy, 0.0) + _paf(t)
+            strategy_count[strategy] = strategy_count.get(strategy, 0) + 1
+            if _paf(t) > 0:
+                strategy_wins[strategy] = strategy_wins.get(strategy, 0) + 1
         
         top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
         top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
@@ -867,6 +922,15 @@ class TradingBot:
             message += "\n\n📉 <b>종목 하위</b>"
             for coin, pnl in top_losers:
                 message += f"\n{coin}: {pnl:+,.0f}원"
+
+        if strategy_count:
+            message += "\n\n🧠 <b>전략별 성과</b>"
+            ranked_strategy = sorted(strategy_profit.items(), key=lambda kv: kv[1], reverse=True)
+            for strategy, pnl in ranked_strategy:
+                cnt = strategy_count.get(strategy, 0)
+                win = strategy_wins.get(strategy, 0)
+                wr = (win / cnt * 100) if cnt > 0 else 0
+                message += f"\n{strategy}: {pnl:+,.0f}원 ({cnt}회, 승률 {wr:.1f}%)"
         
         self.telegram.send_message(message)
     
@@ -1151,6 +1215,20 @@ class TradingBot:
         profit_after_fees_sum = 0.0
         turnover_krw = 0.0
 
+        def _paf_day(tr):
+            paf = tr.get('profit_after_fees_krw', None)
+            if paf is not None:
+                return float(paf or 0)
+            try:
+                buy_price = float(tr.get('buy_price', 0) or 0)
+                amount = float(tr.get('amount', 0) or 0)
+                buy_fee = float(tr.get('buy_fee_krw', 0) or 0)
+                if buy_fee <= 0:
+                    buy_fee = buy_price * amount * fee_rate
+                return float(tr.get('profit_krw', 0) or 0) - buy_fee
+            except Exception:
+                return float(tr.get('profit_krw', 0) or 0)
+
         for t in today_trades:
             try:
                 buy_price = float(t.get('buy_price', 0) or 0)
@@ -1186,6 +1264,7 @@ class TradingBot:
         
         # 코인별 통계
         coin_profits = {}
+        strategy_stats = {}
         for trade in today_trades:
             coin = trade['coin'].replace('KRW-', '')
             if coin not in coin_profits:
@@ -1201,6 +1280,16 @@ class TradingBot:
                     buy_fee = 0.0
                 paf = float(trade.get('profit_krw', 0) or 0) - buy_fee
             coin_profits[coin]['profit'] += float(paf or 0)
+
+            buy_meta = trade.get('buy_meta', {}) if isinstance(trade.get('buy_meta'), dict) else {}
+            strategy = str(trade.get('strategy') or buy_meta.get('strategy') or 'UNKNOWN')
+            if strategy not in strategy_stats:
+                strategy_stats[strategy] = {'trades': 0, 'wins': 0, 'profit': 0.0}
+            strategy_stats[strategy]['trades'] += 1
+            paf_strategy = _paf_day(trade)
+            strategy_stats[strategy]['profit'] += float(paf_strategy or 0)
+            if paf_strategy > 0:
+                strategy_stats[strategy]['wins'] += 1
         
         # 출력
         print(f"\n📊 오늘 ({today.strftime('%Y-%m-%d')})")
@@ -1239,6 +1328,15 @@ class TradingBot:
         for coin, stats in sorted_coins:
             emoji = "📈" if stats['profit'] > 0 else "📉"
             print(f"  {emoji} {coin}: {stats['trades']}회 | {stats['profit']:+,.0f}원")
+
+        if strategy_stats:
+            print(f"\n🧠 전략별 성과")
+            sorted_strategies = sorted(strategy_stats.items(), key=lambda x: x[1]['profit'], reverse=True)
+            for strategy, st in sorted_strategies:
+                trades = st['trades']
+                wins = st['wins']
+                wr = (wins / trades * 100) if trades > 0 else 0
+                print(f"  {strategy}: {st['profit']:+,.0f}원 | {trades}회 | 승률 {wr:.1f}%")
         
         print("="*80 + "\n")
 
@@ -1346,8 +1444,9 @@ class TradingBot:
             daily_profit[d] = 0
             daily_count[d] = 0
 
-        # 종목별 손익
+        # 종목/전략별 손익
         coin_profit = {}
+        strategy_stats = {}
 
         for t in week_trades:
             d = t['timestamp'].date()
@@ -1356,6 +1455,15 @@ class TradingBot:
 
             coin = t['coin'].replace('KRW-', '')
             coin_profit[coin] = coin_profit.get(coin, 0) + _paf(t)
+            buy_meta = t.get('buy_meta', {}) if isinstance(t.get('buy_meta'), dict) else {}
+            strategy = str(t.get('strategy') or buy_meta.get('strategy') or 'UNKNOWN')
+            if strategy not in strategy_stats:
+                strategy_stats[strategy] = {'trades': 0, 'wins': 0, 'profit': 0.0}
+            strategy_stats[strategy]['trades'] += 1
+            paf_strategy = _paf(t)
+            strategy_stats[strategy]['profit'] += float(paf_strategy or 0)
+            if paf_strategy > 0:
+                strategy_stats[strategy]['wins'] += 1
 
         top_winners = sorted(coin_profit.items(), key=lambda kv: kv[1], reverse=True)[:3]
         top_losers = sorted(coin_profit.items(), key=lambda kv: kv[1])[:3]
@@ -1396,6 +1504,15 @@ class TradingBot:
             print(f"\n📉 종목 하위")
             for coin, pnl in top_losers:
                 print(f"  {coin}: {pnl:+,.0f}원")
+
+        if strategy_stats:
+            print(f"\n🧠 전략별 성과")
+            sorted_strategies = sorted(strategy_stats.items(), key=lambda x: x[1]['profit'], reverse=True)
+            for strategy, st in sorted_strategies:
+                trades = st['trades']
+                wins = st['wins']
+                wr = (wins / trades * 100) if trades > 0 else 0
+                print(f"  {strategy}: {st['profit']:+,.0f}원 | {trades}회 | 승률 {wr:.1f}%")
 
         print("="*80 + "\n")
     
@@ -1503,16 +1620,14 @@ class TradingBot:
         return False
     
     def _calculate_dynamic_investment(self, signal_score, available_krw=None, buy_meta=None, orderbook_details=None):
-        """투자 금액 계산 (총 투자 한도 고정 + 점수 기반 효율 배분)."""
+        """투자 금액 계산 (리스크 기반 추천 금액 전용)."""
 
-        min_trade = float(self.config['trading']['min_trade_amount'])
+        min_trade = float(self.config["trading"]["min_trade_amount"])
 
-        # 현재 투자 중인 금액(원가 기준)
         current_investment = sum(
-            pos['buy_price'] * pos['amount']
+            pos["buy_price"] * pos["amount"]
             for pos in self.stats.positions.values()
         )
-
         cap_remaining = max(0.0, float(self.max_total_investment) - float(current_investment))
         if cap_remaining < min_trade:
             return 0.0
@@ -1528,94 +1643,30 @@ class TradingBot:
             except Exception:
                 available_krw = 0.0
 
-        # 실제 주문 가능 예산: 현금 잔고와 투자 한도의 교집합
         tradable_budget = max(0.0, min(cap_remaining, available_krw))
         if tradable_budget < min_trade:
             return 0.0
 
-        # 동적 배분 비활성화 시에도 한도는 반드시 준수
-        if not self.dynamic_allocation:
-            fixed_amount = min(float(self.buy_amount_krw), tradable_budget)
-            return float(int(fixed_amount)) if fixed_amount >= min_trade else 0.0
-
-        # 슬롯 기반 기본 배분: 남은 슬롯 수로 예산을 나눠 한도 활용률을 높임
-        try:
-            max_slots = max(1, int(self.max_coins))
-        except Exception:
-            max_slots = 1
-        active_positions = max(0, len(self.stats.positions))
-        slots_left = max(1, max_slots - active_positions)
-        slot_budget = tradable_budget / slots_left
-
-        # 기존 점수 정책(기본금액 배수) + 슬롯 가중 배분을 함께 사용
-        score = int(signal_score or 0)
-        if score >= 11:
-            legacy_multiplier = 1.5
-            slot_boost = 1.20
-        elif score >= 9:
-            legacy_multiplier = 1.3
-            slot_boost = 1.10
-        else:
-            legacy_multiplier = 1.0
-            slot_boost = 1.00
-
-        legacy_target = min(float(self.buy_amount_krw) * legacy_multiplier, tradable_budget)
-        slot_target = slot_budget * slot_boost
-        target = max(legacy_target, slot_target)
-
-        # 포지션당 최대 집중도 제한 (한 종목 과집중 방지)
-        per_position_cap = float(self.max_total_investment) * float(self.max_position_ratio)
-        per_position_cap = max(min_trade, per_position_cap)
-        target = min(target, per_position_cap)
-
-        # 변동성(ATR) + 체결비용(스프레드) 기반 리스크 가중
-        risk_scale = 1.0
         meta = buy_meta if isinstance(buy_meta, dict) else {}
-        ob = orderbook_details if isinstance(orderbook_details, dict) else {}
-
-        atr_pct = meta.get("atr_pct")
+        recommended = meta.get("recommended_invest_krw")
         try:
-            atr_pct = float(atr_pct) if atr_pct is not None else None
+            recommended = float(recommended) if recommended is not None else 0.0
         except Exception:
-            atr_pct = None
-        if atr_pct is not None:
-            if atr_pct >= 1.20:
-                risk_scale *= 0.75
-            elif atr_pct >= 0.90:
-                risk_scale *= 0.85
-            elif atr_pct <= 0.35:
-                risk_scale *= 1.05
+            recommended = 0.0
 
-        spread_pct = ob.get("spread_pct")
+        if recommended <= 0:
+            return 0.0
+
+        weight_remaining = meta.get("weight_remaining_krw")
         try:
-            spread_pct = float(spread_pct) if spread_pct is not None else None
+            weight_remaining = float(weight_remaining) if weight_remaining is not None else None
         except Exception:
-            spread_pct = None
-        if spread_pct is not None:
-            if spread_pct >= 0.45:
-                risk_scale *= 0.80
-            elif spread_pct >= 0.35:
-                risk_scale *= 0.90
+            weight_remaining = None
+        if weight_remaining is not None and weight_remaining > 0:
+            recommended = min(recommended, weight_remaining)
 
-        volume_ratio = meta.get("volume_ratio")
-        try:
-            volume_ratio = float(volume_ratio) if volume_ratio is not None else None
-        except Exception:
-            volume_ratio = None
-        if volume_ratio is not None and volume_ratio >= 2.5:
-            risk_scale *= 1.05
-
-        risk_scale = max(0.60, min(1.20, risk_scale))
-        target *= risk_scale
-
-        # 남은 슬롯을 위해 최소 주문 가능 금액은 보존
-        reserve_for_others = min_trade * max(0, slots_left - 1)
-        max_this_order = max(0.0, tradable_budget - reserve_for_others)
-        investment = min(target, max_this_order, tradable_budget)
-
+        investment = min(tradable_budget, recommended)
         if investment < min_trade:
-            if slots_left == 1 and tradable_budget >= min_trade:
-                return float(int(tradable_budget))
             return 0.0
 
         return float(int(investment))
@@ -1643,6 +1694,55 @@ class TradingBot:
                 continue
 
         return float(total)
+
+    def _emit_analysis_heartbeat(self, daily_profit_krw=None, daily_profit_pct=None):
+        """주기적 운영 상태 로그(분석용)."""
+        now = datetime.now()
+        if self._last_analysis_heartbeat_at:
+            elapsed = (now - self._last_analysis_heartbeat_at).total_seconds()
+            if elapsed < (self.analysis_heartbeat_minutes * 60):
+                return
+        self._last_analysis_heartbeat_at = now
+
+        status = self.stats.get_current_status()
+        invested = sum(pos['buy_price'] * pos['amount'] for pos in self.stats.positions.values())
+        available = max(0.0, min(self.max_total_investment - invested, status['current_balance']))
+
+        payload = {
+            "ts": now.isoformat(),
+            "global_regime": getattr(self.engine, "global_regime", "RANGE"),
+            "target_coins": list(self.target_coins),
+            "positions_count": int(len(self.stats.positions)),
+            "positions": [
+                {
+                    "ticker": t,
+                    "amount": float(p.get("amount", 0) or 0),
+                    "buy_price": float(p.get("buy_price", 0) or 0),
+                }
+                for t, p in self.stats.positions.items()
+            ],
+            "capital": {
+                "max_total_investment_krw": float(self.max_total_investment),
+                "invested_krw": float(invested),
+                "available_krw": float(available),
+                "cash_krw": float(status.get("current_balance", 0) or 0),
+                "total_value_krw": float(status.get("total_value", 0) or 0),
+            },
+            "performance": {
+                "total_return_pct": float(status.get("total_return", 0) or 0),
+                "total_trades": int(status.get("total_trades", 0) or 0),
+                "win_rate_pct": float(status.get("win_rate", 0) or 0),
+                "daily_profit_krw": float(daily_profit_krw if daily_profit_krw is not None else 0),
+                "daily_profit_pct": float(daily_profit_pct if daily_profit_pct is not None else 0),
+                "total_fees_krw": float(status.get("total_fees_krw", 0) or 0),
+            },
+            "state": {
+                "running": bool(self.is_running),
+                "trading_paused": bool(self.is_trading_paused),
+                "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            },
+        }
+        self.logger.log_decision("LOOP_HEARTBEAT", payload)
     
     def _refresh_coin_list(self, reason="auto"):
         """코인 목록 갱신 (기존 포지션은 유지).
@@ -1652,6 +1752,12 @@ class TradingBot:
         """
         
         self.logger.info("🔄 코인 목록 갱신 시작")
+        try:
+            force_regime = reason in ("hourly", "manual")
+            regime, _ = self.engine.update_global_regime(force=force_regime)
+            self.logger.info(f"🌐 종목 갱신 전 레짐 확인: {regime}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ 종목 갱신 전 레짐 확인 실패: {e}")
         
         # 실패 시에도 다음 주기까지 대기하도록 \"시도\" 시각을 먼저 갱신
         refresh_ts = datetime.now()
@@ -1661,23 +1767,37 @@ class TradingBot:
         new_coins = self.coin_selector.get_top_coins(self.max_coins)
         
         if not new_coins:
-            self.logger.warning("⚠️  새로운 코인 선정 실패, 기존 목록 유지")
-            if reason == "empty":
+            current_regime = getattr(self.engine, "global_regime", "RANGE")
+            is_bear_wait = (current_regime == "BEAR")
+            if is_bear_wait:
+                self.logger.info("🛑 BEAR 레짐으로 신규 진입 대기 (기존 목록 유지)")
+            else:
+                self.logger.warning("⚠️  새로운 코인 선정 실패, 기존 목록 유지")
+
+            if reason == "empty" and not is_bear_wait:
                 self._empty_list_fail_count = int(self._empty_list_fail_count or 0) + 1
             self.logger.log_decision(
                 "COIN_REFRESH",
                 {
                     "reason": reason,
                     "ok": False,
+                    "global_regime": current_regime,
+                    "bear_wait": bool(is_bear_wait),
                     "selected": [],
                     "fail_count_empty": int(self._empty_list_fail_count or 0),
                 },
             )
             if reason == "hourly":
-                self.telegram.send_message(
-                    "⚠️ <b>1시간 자동 종목 갱신 실패</b>\n\n"
-                    "조건에 맞는 코인이 없어 기존 목록을 유지합니다."
-                )
+                if is_bear_wait:
+                    self.telegram.send_message(
+                        "⏱️ <b>1시간 자동 종목 갱신</b>\n\n"
+                        "현재 글로벌 레짐이 BEAR로 판단되어 신규 진입을 대기합니다."
+                    )
+                else:
+                    self.telegram.send_message(
+                        "⚠️ <b>1시간 자동 종목 갱신 실패</b>\n\n"
+                        "조건에 맞는 코인이 없어 기존 목록을 유지합니다."
+                    )
             return
         
         # 성공 시 empty 재시도 백오프 리셋
@@ -1705,6 +1825,7 @@ class TradingBot:
             {
                 "reason": reason,
                 "ok": True,
+                "global_regime": getattr(self.engine, "global_regime", "RANGE"),
                 "selected": list(new_coins),
                 "kept": [c for c in sorted(kept_coins)],
                 "added": [c for c in sorted(added_coins)],
@@ -1802,6 +1923,21 @@ class TradingBot:
                     if self.is_trading_paused:
                         time.sleep(60)  # 1분마다 체크
                         continue
+
+                # 글로벌 레짐 주기 갱신
+                try:
+                    self.engine.update_global_regime(force=False)
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 레짐 갱신 오류: {e}")
+
+                # 주기적 분석 로그(운영 상태 스냅샷)
+                try:
+                    self._emit_analysis_heartbeat(
+                        daily_profit_krw=daily_profit,
+                        daily_profit_pct=daily_profit_pct,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 분석 heartbeat 기록 오류: {e}")
                 
                 # 코인 목록 갱신 체크 (설정된 시간마다)
                 if self.last_coin_refresh:
@@ -1882,36 +2018,36 @@ class TradingBot:
                         # 손절 직후 동일 종목 재진입 방지
                         if self.reentry_cooldown_after_stoploss_minutes > 0 and self._is_reentry_cooldown_active(ticker):
                             continue
+
+                        # 동시 포지션 제한
+                        if len(self.stats.positions) >= self.max_coins:
+                            continue
                         
                         # 매수 신호 확인
                         buy_signal, signals, current_price, signal_score, buy_meta = self.engine.check_buy_signal(ticker)
 
-                        # 분석 로그: 점수는 충분한데(또는 근접한데) 품질 필터로 차단된 케이스 기록
-                        try:
-                            min_score = int(
-                                self.config.get('strategy', {}).get(
-                                    'entry_min_score',
-                                    self.config.get('indicators', {}).get('min_signal_score', 7)
-                                ) or 7
+                        # 분석 로그: 차단 사유를 변경 시점마다 기록 (중복 로그 억제)
+                        if (not buy_signal) and isinstance(buy_meta, dict) and buy_meta.get("blocked_by"):
+                            blocked_by = sorted(list(set(buy_meta.get("blocked_by") or [])))
+                            signature = (
+                                str(buy_meta.get("candle_ts") or ""),
+                                tuple(blocked_by),
+                                int(signal_score or 0),
+                                str(getattr(self.engine, "global_regime", "RANGE")),
                             )
-                        except Exception:
-                            min_score = 7
-                        if (
-                            (not buy_signal)
-                            and isinstance(buy_meta, dict)
-                            and buy_meta.get("blocked_by")
-                            and int(signal_score or 0) >= min_score
-                        ):
-                            self.logger.log_decision(
-                                "BUY_BLOCKED",
-                                {
-                                    "ticker": ticker,
-                                    "score": int(signal_score or 0),
-                                    "signals": list(signals),
-                                    "blocked_by": list(buy_meta.get("blocked_by") or []),
-                                    "meta": buy_meta,
-                                },
-                            )
+                            if self._last_buy_block_signature.get(ticker) != signature:
+                                self._last_buy_block_signature[ticker] = signature
+                                self.logger.log_decision(
+                                    "BUY_BLOCKED",
+                                    {
+                                        "ticker": ticker,
+                                        "global_regime": getattr(self.engine, "global_regime", "RANGE"),
+                                        "score": int(signal_score or 0),
+                                        "signals": list(signals),
+                                        "blocked_by": blocked_by,
+                                        "meta": buy_meta,
+                                    },
+                                )
                         
                         if buy_signal and current_price:
                             candle_ts = str((buy_meta or {}).get("candle_ts") or "")
@@ -1969,6 +2105,24 @@ class TradingBot:
                                 available_krw=available_krw,
                                 buy_meta=buy_meta,
                                 orderbook_details=orderbook_details,
+                            )
+
+                            self.logger.log_decision(
+                                "BUY_SIZING",
+                                {
+                                    "ticker": ticker,
+                                    "global_regime": getattr(self.engine, "global_regime", "RANGE"),
+                                    "score": int(signal_score),
+                                    "available_krw": float(available_krw),
+                                    "invest_amount_krw": float(invest_amount),
+                                    "min_trade_krw": float(self.config['trading']['min_trade_amount']),
+                                    "recommended_invest_krw": float((buy_meta or {}).get("recommended_invest_krw", 0) or 0),
+                                    "risk_krw": float((buy_meta or {}).get("risk_krw", 0) or 0),
+                                    "weight_remaining_krw": float((buy_meta or {}).get("weight_remaining_krw", 0) or 0),
+                                    "total_cap_remaining_krw": float((buy_meta or {}).get("total_cap_remaining_krw", 0) or 0),
+                                    "spread_pct": float((orderbook_details or {}).get("spread_pct", 0) or 0),
+                                    "meta": buy_meta or {},
+                                },
                             )
                             
                             if invest_amount >= self.config['trading']['min_trade_amount']:
@@ -2072,8 +2226,29 @@ class TradingBot:
                                         # 매수 완료 (성공/실패 상관없이 제거)
                                         with self.buy_lock:
                                             self.buying_in_progress.discard(ticker)
+                                else:
+                                    self.logger.log_decision(
+                                        "BUY_SKIPPED",
+                                        {
+                                            "ticker": ticker,
+                                            "reason": "insufficient_krw",
+                                            "available_krw": float(available_krw),
+                                            "required_krw": float(invest_amount),
+                                            "meta": buy_meta or {},
+                                        },
+                                    )
                             else:
                                 self.logger.debug(f"  {ticker} 투자 한도 초과 또는 부족")
+                                self.logger.log_decision(
+                                    "BUY_SKIPPED",
+                                    {
+                                        "ticker": ticker,
+                                        "reason": "below_min_trade",
+                                        "invest_amount_krw": float(invest_amount),
+                                        "min_trade_krw": float(self.config['trading']['min_trade_amount']),
+                                        "meta": buy_meta or {},
+                                    },
+                                )
                     
                     # 포지션 있을 때 - 매도 검토
                     elif ticker in self.stats.positions:
@@ -2106,6 +2281,16 @@ class TradingBot:
                                 buy_cost = position['buy_price'] * sell_result['amount']
                                 profit_krw = sell_result['total_krw'] - buy_cost
                                 profit_rate = ((sell_result['price'] - position['buy_price']) / position['buy_price']) * 100
+                                if not isinstance(sell_meta, dict):
+                                    sell_meta = {}
+                                buy_meta = position.get("buy_meta", {}) if isinstance(position.get("buy_meta"), dict) else {}
+                                stop_price = float(buy_meta.get("stop_price", 0) or 0)
+                                risk_unit = (position['buy_price'] - stop_price) if stop_price > 0 else 0.0
+                                if risk_unit > 0:
+                                    realized_r = (sell_result['price'] - position['buy_price']) / risk_unit
+                                    sell_meta.setdefault("stop_price", float(stop_price))
+                                    sell_meta.setdefault("risk_unit", float(risk_unit))
+                                    sell_meta["r_multiple"] = float(sell_meta.get("r_multiple", realized_r) or realized_r)
                                 
                                 # 잔고 업데이트
                                 new_balance = self.engine.get_balance("KRW")
