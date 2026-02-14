@@ -1346,49 +1346,66 @@ class TradingEngine:
                             f"uuid={order_uuid} price={bid_price:,.0f} qty={buy_amount:.8f}"
                         )
                         self.logger.info("Limit order placed, waiting fill...")
-                        
-                        # 체결 대기
-                        time.sleep(self.limit_wait_seconds)
-                        
-                        # 체결 확인
-                        order_info = self._safe_get_order(order_uuid)
-                        if order_info is None:
-                            self.logger.warning(
-                                f"LIMIT_ORDER_STATUS_UNKNOWN | side=BUY ticker={ticker} "
-                                f"uuid={order_uuid} action=cancel_before_fallback"
-                            )
-                            cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
-                            self.logger.info(
-                                f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
-                                f"uuid={order_uuid} ok={cancel_ok} reason=status_unknown"
-                            )
-                            if not cancel_ok:
-                                self.logger.error(
-                                    f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} reason=cancel_failed_status_unknown"
-                                )
-                            else:
-                                self.logger.error(
-                                    f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} reason=status_unknown_fail_closed"
-                                )
-                            return None
 
-                        if order_info:
-                            executed_volume = float(order_info.get('executed_volume', 0))
-                            
-                            # 완전 체결
-                            if order_info['state'] == 'done':
-                                avg_price = float(order_info.get('avg_buy_price', 0))
-                                paid_fee = float(order_info.get('paid_fee', 0))
-                                
-                                # avg_buy_price가 없거나 0이면 bid_price 사용
+                        try:
+                            poll_interval = float(self.config.get("trading", {}).get("limit_poll_interval_seconds", 0.3))
+                        except Exception:
+                            poll_interval = 0.3
+                        poll_interval = max(0.1, min(2.0, poll_interval))
+                        wait_seconds = max(0.0, float(self.limit_wait_seconds))
+                        deadline = time.time() + wait_seconds
+                        first_poll = True
+                        min_trade_amount = float(self.config.get("trading", {}).get("min_trade_amount", 5500))
+
+                        # 지정가 상태를 짧은 간격으로 확인(단, wait_seconds=0이어도 최소 1회 조회)
+                        while first_poll or time.time() < deadline:
+                            first_poll = False
+                            order_info = self._safe_get_order(order_uuid)
+                            if order_info is None:
+                                self.logger.warning(
+                                    f"LIMIT_ORDER_STATUS_UNKNOWN | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} action=cancel_before_fallback"
+                                )
+                                cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
+                                self.logger.info(
+                                    f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} ok={cancel_ok} reason=status_unknown"
+                                )
+                                if cancel_ok:
+                                    self.logger.warning(
+                                        f"ABORT_FALLBACK_UNKNOWN_STATE | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} cancel_ok=True"
+                                    )
+                                else:
+                                    self.logger.error(
+                                        f"CANCEL_FAILED_UNKNOWN_STATE | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} abort_fallback"
+                                    )
+                                    self.logger.error(
+                                        f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                        f"uuid={order_uuid} reason=cancel_failed_status_unknown"
+                                    )
+                                return None
+
+                            executed_volume = float(order_info.get('executed_volume', 0) or 0)
+                            remaining_volume = float(order_info.get('remaining_volume', 0) or 0)
+                            state = str(order_info.get('state', '') or '').lower()
+
+                            # 완전 체결(or 잔량 0) 처리
+                            if state == 'done' or (remaining_volume <= 0 and executed_volume > 0):
+                                avg_price = float(order_info.get('avg_buy_price', 0) or 0)
+                                paid_fee = float(order_info.get('paid_fee', 0) or 0)
+
                                 if avg_price == 0:
                                     avg_price = bid_price
                                     self.logger.warning(f"  ⚠️  avg_buy_price 없음, bid_price 사용: {avg_price:,.0f}원")
-                                
+
+                                self.logger.info(
+                                    f"LIMIT_ORDER_FILLED | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} executed={executed_volume:.8f} state={state or 'unknown'}"
+                                )
                                 self.logger.info(f"  ✅ 지정가 완전체결: {avg_price:,.0f}원 × {executed_volume:.8f}")
-                                
+
                                 return {
                                     'price': avg_price,
                                     'amount': executed_volume,
@@ -1396,16 +1413,18 @@ class TradingEngine:
                                     'fee': paid_fee,
                                     'uuid': order_uuid
                                 }
-                            
+
                             # 부분 체결
-                            elif executed_volume > 0:
+                            if executed_volume > 0:
+                                self.logger.info(
+                                    f"LIMIT_ORDER_PARTIAL | side=BUY ticker={ticker} "
+                                    f"uuid={order_uuid} executed={executed_volume:.8f} remaining={remaining_volume:.8f}"
+                                )
                                 self.logger.warning(f"  ⚠️  부분체결: {executed_volume:.8f} / {buy_amount:.8f}")
-                                
-                                # 부분 체결된 금액 계산
+
                                 executed_value = executed_volume * bid_price
-                                remaining_value = invest_amount - executed_value
-                                
-                                # 주문 취소 확인 전에는 시장가 폴백 금지
+                                remaining_value = max(0.0, invest_amount - executed_value)
+
                                 cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
                                 self.logger.info(
                                     f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
@@ -1419,80 +1438,78 @@ class TradingEngine:
                                     return None
                                 self.logger.info(f"Cancel confirmation: {cancel_ok}")
                                 time.sleep(0.3)
-                                
-                                # 남은 금액이 최소 주문금액 이상이면 시장가로 처리
-                                if remaining_value >= self.config['trading']['min_trade_amount']:
+
+                                if remaining_value >= min_trade_amount:
                                     self.logger.info(
                                         f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
                                         f"uuid={order_uuid} reason=partial_fill remaining_krw={remaining_value:,.0f}"
                                     )
                                     self.logger.info("Fallback to market triggered.")
                                     self.logger.info(f"  ↪️  남은 {remaining_value:,.0f}원 시장가 처리")
-                                    
-                                    # 시장가로 남은 금액 매수
+
                                     market_result = self.upbit.buy_market_order(ticker, remaining_value)
                                     if market_result and 'uuid' in market_result:
                                         time.sleep(0.5)
                                         market_order = self._safe_get_order(market_result['uuid'])
-                                        
+
                                         if market_order:
-                                            market_volume = float(market_order.get('executed_volume', 0))
-                                            market_price = float(market_order.get('avg_buy_price', current_price))
-                                            market_fee = float(market_order.get('paid_fee', 0))
-                                            
-                                            # 합산
+                                            market_volume = float(market_order.get('executed_volume', 0) or 0)
+                                            market_price = float(market_order.get('avg_buy_price', current_price) or current_price)
+                                            market_fee = float(market_order.get('paid_fee', 0) or 0)
+
                                             total_volume = executed_volume + market_volume
-                                            total_fees = float(order_info.get('paid_fee', 0)) + market_fee
-                                            avg_price = (executed_volume * bid_price + market_volume * market_price) / total_volume
-                                            
+                                            if total_volume <= 0:
+                                                return None
+                                            total_fees = float(order_info.get('paid_fee', 0) or 0) + market_fee
+                                            avg_price = (
+                                                (executed_volume * bid_price) + (market_volume * market_price)
+                                            ) / total_volume
+
                                             self.logger.info(f"  ✅ 부분+시장가 체결완료: 평단 {avg_price:,.0f}원")
-                                            
+
                                             return {
                                                 'price': avg_price,
                                                 'amount': total_volume,
                                                 'total_krw': invest_amount,
                                                 'fee': total_fees,
-                                                'uuid': order_uuid  # 첫 주문 UUID
+                                                'uuid': order_uuid
                                             }
-                                
-                                # 남은 금액이 적으면 부분체결만으로 종료
-                                else:
-                                    avg_price = float(order_info.get('avg_buy_price', bid_price))
-                                    paid_fee = float(order_info.get('paid_fee', 0))
-                                    
-                                    if avg_price == 0:
-                                        avg_price = bid_price
-                                    
-                                    self.logger.info(f"  ✅ 부분체결로 종료: {avg_price:,.0f}원")
-                                    
-                                    return {
-                                        'price': avg_price,
-                                        'amount': executed_volume,
-                                        'total_krw': executed_volume * avg_price,
-                                        'fee': paid_fee,
-                                        'uuid': order_uuid
-                                    }
-                            
-                            # 미체결 - 주문 취소 후 시장가로 폴백
-                            else:
-                                cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
-                                self.logger.info(
-                                    f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} ok={cancel_ok} reason=not_filled"
-                                )
-                                if not cancel_ok:
-                                    self.logger.error(
-                                        f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
-                                        f"uuid={order_uuid} reason=cancel_failed_not_filled"
-                                    )
-                                    return None
-                                self.logger.info(
-                                    f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
-                                    f"uuid={order_uuid} reason=not_filled"
-                                )
-                                self.logger.info("Fallback to market triggered.")
-                                self.logger.info(f"Cancel confirmation: {cancel_ok}")
-                                time.sleep(0.3)
+
+                                avg_price = float(order_info.get('avg_buy_price', bid_price) or bid_price)
+                                paid_fee = float(order_info.get('paid_fee', 0) or 0)
+                                if avg_price == 0:
+                                    avg_price = bid_price
+
+                                self.logger.info(f"  ✅ 부분체결로 종료: {avg_price:,.0f}원")
+                                return {
+                                    'price': avg_price,
+                                    'amount': executed_volume,
+                                    'total_krw': executed_volume * avg_price,
+                                    'fee': paid_fee,
+                                    'uuid': order_uuid
+                                }
+
+                            sleep_left = deadline - time.time()
+                            if sleep_left > 0:
+                                time.sleep(min(poll_interval, sleep_left))
+
+                        # 타임아웃: 취소 성공 확인 후에만 시장가 폴백
+                        cancel_ok = self._try_cancel_limit(order_uuid, side="BUY", ticker=ticker, retries=3)
+                        self.logger.info(
+                            f"LIMIT_ORDER_TIMEOUT_CANCEL_RESULT | side=BUY ticker={ticker} "
+                            f"uuid={order_uuid} ok={cancel_ok} reason=timeout"
+                        )
+                        if not cancel_ok:
+                            self.logger.error(
+                                f"FALLBACK_ABORTED | side=BUY ticker={ticker} "
+                                f"uuid={order_uuid} reason=cancel_failed_timeout"
+                            )
+                            return None
+                        self.logger.info(
+                            f"LIMIT_ORDER_TIMEOUT_FALLBACK_MARKET | side=BUY ticker={ticker} "
+                            f"uuid={order_uuid} reason=timeout"
+                        )
+                        self.logger.info("Fallback to market triggered.")
                 else:
                     self.logger.warning(f"LIMIT_ORDERBOOK_PARSE_FAIL | side=BUY ticker={ticker}")
                     self.logger.warning(f"{ticker} orderbook parse 실패, 시장가 폴백")

@@ -239,6 +239,7 @@ class TradingEngineOrderbookTests(unittest.TestCase):
         self.assertGreaterEqual(len(engine.upbit.cancel_calls), 1)
         self.assertTrue(logger.has_warning("LIMIT_ORDER_STATUS_UNKNOWN"))
         self.assertTrue(logger.has_info("LIMIT_ORDER_TIMEOUT_CANCEL_RESULT"))
+        self.assertTrue(logger.has_error("CANCEL_FAILED_UNKNOWN_STATE"))
         self.assertTrue(logger.has_error("FALLBACK_ABORTED"))
 
     def test_unknown_limit_status_cancel_ok_still_fails_closed(self):
@@ -258,7 +259,8 @@ class TradingEngineOrderbookTests(unittest.TestCase):
         self.assertEqual(len(engine.upbit.buy_market_calls), 0)
         self.assertTrue(logger.has_warning("LIMIT_ORDER_STATUS_UNKNOWN"))
         self.assertTrue(logger.has_info("LIMIT_ORDER_TIMEOUT_CANCEL_RESULT"))
-        self.assertTrue(logger.has_error("FALLBACK_ABORTED"))
+        self.assertTrue(logger.has_warning("ABORT_FALLBACK_UNKNOWN_STATE"))
+        self.assertFalse(logger.has_error("FALLBACK_ABORTED"))
 
 
 if __name__ == "__main__":
