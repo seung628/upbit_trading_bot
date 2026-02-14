@@ -1612,11 +1612,12 @@ class TradingEngine:
             if current_price is None:
                 return None
             
-            # 최소 주문 금액 체크 (5,500원)
+            # 최소 주문 금액 체크 (설정값)
+            min_trade_amount = float(self.config.get("trading", {}).get("min_trade_amount", 5500))
             sell_value = sell_amount * current_price
-            if sell_value < 5500:
+            if sell_value < min_trade_amount:
                 self.logger.warning(
-                    f"⚠️  {ticker} 매도 금액 부족: {sell_value:,.0f}원 < 5,500원"
+                    f"⚠️  {ticker} 매도 금액 부족: {sell_value:,.0f}원 < {min_trade_amount:,.0f}원"
                 )
                 return None
             

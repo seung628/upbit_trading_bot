@@ -229,7 +229,7 @@ class TradingLogger:
         self.logger.info(f"  승: {stats.get('wins', 0)} / 패: {stats.get('losses', 0)}")
         self.logger.info(f"  승률: {stats.get('win_rate', 0):.1f}%")
         self.logger.info(f"  총 수익: {stats.get('total_profit_krw', 0):+,.0f}원")
-        self.logger.info(f"  수익률: {stats.get('total_profit_rate', 0):+.2f}%")
+        self.logger.info(f"  수익률: {stats.get('total_return', 0):+.2f}%")
         self.logger.info("="*80)
     
     def info(self, message):

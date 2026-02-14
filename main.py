@@ -76,6 +76,7 @@ class TradingBot:
             reconcile_sec = 120
         self.position_reconcile_interval_seconds = max(30, reconcile_sec)
         self._last_position_reconcile_at = None
+        self._position_missing_counts = {}
         
         # 손절 후 동일 종목 재진입 쿨다운(과매매/휘둘림 방지)
         try:
@@ -125,9 +126,16 @@ class TradingBot:
         
         # 초기 잔고 확인
         initial_balance = self.engine.get_balance("KRW")
+        min_trade_amount = float(self.config['trading']['min_trade_amount'])
         if initial_balance < self.config['trading']['min_trade_amount']:
-            print(f"❌ 거래 가능 금액이 부족합니다. (최소 {self.config['trading']['min_trade_amount']:,}원)")
-            return
+            self.logger.warning(
+                f"⚠️ 거래 가능 KRW 부족: {initial_balance:,.0f}원 < 최소 {min_trade_amount:,.0f}원 "
+                "(기존 포지션 관리 모드로 시작)"
+            )
+            print(
+                f"⚠️ 거래 가능 KRW가 최소금액보다 적습니다. "
+                f"({initial_balance:,.0f}원 < {min_trade_amount:,.0f}원)"
+            )
 
         # 포지션 복구 시도
         saved_positions = self.stats.load_positions()
@@ -592,24 +600,44 @@ class TradingBot:
                 return
         self._last_position_reconcile_at = now
 
-        view, _ = self._get_tracked_position_view()
-        changed_count = 0
+        live_map = self._get_exchange_balance_map()
+        if self.stats.positions and not live_map:
+            self.logger.warning("⚠️ 실계좌 잔고 스냅샷 비어 있음: 포지션 동기화 건너뜀")
+            return
 
-        for ticker, synced in view.items():
-            pos = self.stats.positions.get(ticker)
+        changed_count = 0
+        removed_count = 0
+
+        for ticker, pos in list(self.stats.positions.items()):
             if not isinstance(pos, dict):
                 continue
 
+            live = live_map.get(ticker)
+            live_amount = float((live or {}).get("amount", 0) or 0)
+
+            # 실잔고 미존재 상태가 반복되면 고스트 포지션 제거
+            if live_amount <= 0:
+                miss = int(self._position_missing_counts.get(ticker, 0) or 0) + 1
+                self._position_missing_counts[ticker] = miss
+                if miss >= 3:
+                    self.logger.warning(f"⚠️ 실잔고 미존재 포지션 제거: {ticker} (연속 {miss}회)")
+                    self.stats.positions.pop(ticker, None)
+                    self._position_missing_counts.pop(ticker, None)
+                    changed_count += 1
+                    removed_count += 1
+                continue
+
+            self._position_missing_counts.pop(ticker, None)
+
             old_amount = float(pos.get("amount", 0) or 0)
             old_buy = float(pos.get("buy_price", 0) or 0)
-            new_amount = float(synced.get("amount", 0) or 0)
-            new_buy = float(synced.get("buy_price", 0) or 0)
+            new_amount = live_amount
+            new_buy = float((live or {}).get("avg_buy_price", 0) or 0)
 
             changed = False
-            if new_amount > 0:
-                if old_amount <= 0 or abs(new_amount - old_amount) / max(old_amount, 1e-8) > 0.001:
-                    pos["amount"] = new_amount
-                    changed = True
+            if old_amount <= 0 or abs(new_amount - old_amount) / max(old_amount, 1e-8) > 0.001:
+                pos["amount"] = new_amount
+                changed = True
 
             if new_buy > 0:
                 if old_buy <= 0 or abs(new_buy - old_buy) / max(old_buy, 1e-8) > 0.0001:
@@ -621,7 +649,9 @@ class TradingBot:
 
         if changed_count > 0:
             self.stats.save_positions()
-            self.logger.info(f"🔄 실계좌 포지션 동기화: {changed_count}개 ({reason})")
+            self.logger.info(
+                f"🔄 실계좌 포지션 동기화: 변경 {changed_count}개 / 제거 {removed_count}개 ({reason})"
+            )
     
     def _sync_untracked_balances(self):
         """스냅샷에 없는 실제 잔고를 설정에 따라 편입/정리"""
@@ -635,7 +665,7 @@ class TradingBot:
                 if not currency or currency == "KRW":
                     continue
                 
-                amount = float(bal.get('balance', 0) or 0)
+                amount = float(bal.get('balance', 0) or 0) + float(bal.get('locked', 0) or 0)
                 if amount <= 0:
                     continue
                 
@@ -733,6 +763,18 @@ class TradingBot:
         
         self.logger.warning("⏹️  트레이딩 정지 요청")
         self.is_running = False
+
+        # 거래 루프 종료 대기(주문 경합 방지)
+        if (
+            self.trading_thread
+            and self.trading_thread.is_alive()
+            and threading.current_thread() is not self.trading_thread
+        ):
+            try:
+                # 루프 내부의 60초 대기 구간(쿨다운/시간외)까지 고려해 충분히 대기
+                self.trading_thread.join(timeout=max(70, int(self.check_interval) + 5))
+            except Exception:
+                pass
         
         # 모든 포지션 정리
         if self.stats.positions:
@@ -2009,6 +2051,9 @@ class TradingBot:
                     if held not in tickers_to_check:
                         tickers_to_check.append(held)
 
+                # 루프 1회 기준 실잔고 스냅샷(locked 포함) 재사용
+                exchange_balances_loop = self._get_exchange_balance_map()
+
                 for ticker in tickers_to_check:
                     
                     # 포지션 없을 때 - 매수 검토
@@ -2028,7 +2073,12 @@ class TradingBot:
                             
                             # 3단계: 실제 잔고 확인 (유령 포지션 방지)
                             coin = ticker.split('-')[1]
-                            actual_balance = self.engine.upbit.get_balance(coin)
+                            live = exchange_balances_loop.get(ticker)
+                            if live is None:
+                                # 스냅샷이 비어 있을 때 보수적 폴백
+                                actual_balance = float(self.engine.upbit.get_balance(coin) or 0)
+                            else:
+                                actual_balance = float(live.get("amount", 0) or 0)
                             if actual_balance > 0:
                                 # 최소 주문금액 미만의 잔고(dust)는 매수 차단에서 제외
                                 current_price = self.engine.get_current_price(ticker)
