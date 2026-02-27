@@ -375,7 +375,7 @@ class TelegramNotifier:
             "BEAR": "하락장(BEAR)",
             "RANGE": "횡보장(RANGE)",
         }
-        return labels.get(value, value or "UNKNOWN")
+        return labels.get(value, value or "알 수 없음")
 
     def notify_market_change(self, previous_regime, current_regime, detect_meta=None, confirm_count=None):
         """시장 국면(레짐) 변경 알림"""
@@ -432,7 +432,7 @@ class TelegramNotifier:
                     bot_name = data['result'].get('username', 'Unknown')
                     return True, f"연결 성공: @{bot_name}"
                 else:
-                    return False, "Bot Token이 잘못되었습니다"
+                    return False, "봇 토큰이 잘못되었습니다"
             else:
                 return False, f"HTTP 오류: {response.status_code}"
                 
