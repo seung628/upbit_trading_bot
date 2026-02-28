@@ -365,7 +365,7 @@ class TradingBot:
             "BEAR": "하락장(BEAR)",
             "RANGE": "횡보장(RANGE)",
         }
-        return labels.get(value, value or "알 수 없음")
+        return labels.get(value, value or "UNKNOWN")
 
     def _get_market_snapshot(self, probe=True):
         """현재 시장 상황(레짐/기준지표) 스냅샷."""
@@ -2068,9 +2068,9 @@ class TradingBot:
                                                 buy_meta=buy_meta,
                                             )
                                             self.logger.info(
-                                                f"포지션 개설 확인: {ticker} "
-                                                f"수량={float(buy_result.get('amount', 0) or 0):.8f} "
-                                                f"가격={float(buy_result.get('price', 0) or 0):,.0f}"
+                                                f"Position open confirmation: {ticker} "
+                                                f"amount={float(buy_result.get('amount', 0) or 0):.8f} "
+                                                f"price={float(buy_result.get('price', 0) or 0):,.0f}"
                                             )
                                             
                                             # 잔고 업데이트
@@ -2400,14 +2400,14 @@ def print_help():
     print("="*80)
     print("📖 사용 가능한 명령어")
     print("="*80)
-    print("  start  / 시작  - 트레이딩 시작 (고정 종목 기준 자동 매매 시작)")
-    print("  stop   / 정지  - 트레이딩 정지 (모든 포지션 청산)")
-    print("  status / 상태  - 현재 거래 상태 및 통계 표시")
-    print("  daily  / 일일  - 오늘의 거래 통계 표시")
-    print("  weekly / 주간  - 최근 7일 거래 통계 표시")
-    print("  version / 버전 - 버전 정보 표시")
-    print("  help   / 도움말 - 도움말 표시")
-    print("  exit   / 종료  - 프로그램 종료")
+    print("  start   - 트레이딩 시작 (고정 종목 기준 자동 매매 시작)")
+    print("  stop    - 트레이딩 정지 (모든 포지션 청산)")
+    print("  status  - 현재 거래 상태 및 통계 표시")
+    print("  daily   - 오늘의 거래 통계 표시")
+    print("  weekly  - 최근 7일 거래 통계 표시")
+    print("  version - 버전 정보 표시")
+    print("  help    - 도움말 표시")
+    print("  exit    - 프로그램 종료")
     print("")
     print("💡 Tip: 위/아래 방향키로 이전 명령어를 불러올 수 있습니다")
     print("="*80 + "\n")
@@ -2458,28 +2458,28 @@ def main():
                 except:
                     pass
             
-            if command in ('start', '시작'):
+            if command == 'start':
                 bot.start()
-
-            elif command in ('stop', '정지'):
+            
+            elif command == 'stop':
                 bot.stop()
-
-            elif command in ('status', '상태'):
+            
+            elif command == 'status':
                 bot.status()
-
-            elif command in ('daily', '일일'):
+            
+            elif command == 'daily':
                 bot.daily_stats()
 
-            elif command in ('weekly', '주간'):
+            elif command == 'weekly':
                 bot.weekly_stats()
-
-            elif command in ('version', '버전'):
+            
+            elif command == 'version':
                 print(f"ℹ️ {BOT_NAME} v{BOT_VERSION}")
-
-            elif command in ('help', '도움말'):
+            
+            elif command == 'help':
                 print_help()
-
-            elif command in ('exit', 'quit', '종료'):
+            
+            elif command == 'exit' or command == 'quit':
                 bot.exit_program()
             
             elif command == '':
