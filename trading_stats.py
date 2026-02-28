@@ -6,14 +6,15 @@ from datetime import datetime
 from collections import defaultdict
 import json
 import os
+import tempfile
 import threading
 import pyupbit
 
 
 class TradingStats:
     def __init__(self):
-        # 스레드 안전성
-        self.lock = threading.Lock()
+        # 스레드 안전성 (RLock: save_positions가 락 보유 중에도 재진입 가능)
+        self.lock = threading.RLock()
         
         self.initial_balance = 0
         self.current_balance = 0
@@ -136,7 +137,7 @@ class TradingStats:
             profit_rate = ((sell_price - buy_price) / buy_price) * 100
             buy_fee_krw = float(position.get('buy_fee_krw', 0) or 0)
             sell_fee_krw = float(sell_fee_krw or 0)
-            profit_after_fees_krw = float(profit_krw) - buy_fee_krw
+            profit_after_fees_krw = float(profit_krw) - buy_fee_krw - sell_fee_krw
             buy_meta = position.get('buy_meta', {}) if isinstance(position.get('buy_meta'), dict) else {}
             sell_meta_dict = sell_meta if isinstance(sell_meta, dict) else {}
 
@@ -235,65 +236,74 @@ class TradingStats:
     
     def get_current_status(self):
         """현재 상태 조회"""
+        # 락 안에서는 공유 상태만 스냅샷으로 복사 (API 호출 금지)
         with self.lock:
-            total_value = self.current_balance
-            
-            # 보유 포지션 평가액 계산 (현재가 기준)
-            position_details = []
-            for coin, pos in self.positions.items():
-                current_price = pyupbit.get_current_price(coin)
-                if not current_price:
-                    current_price = pos['buy_price']
-                
-                total_value += current_price * pos['amount']
-                position_details.append({
+            base_balance = self.current_balance
+            initial_balance = self.initial_balance
+            peak_balance = self.peak_balance
+            max_drawdown = self.max_drawdown
+            total_trades = self.total_trades
+            wins = self.wins
+            losses = self.losses
+            total_profit_krw = self.total_profit_krw
+            total_profit_after_fees_krw = self.total_profit_after_fees_krw
+            total_fees = self.total_fees
+            start_time = self.start_time
+            positions_snapshot = [
+                {
                     'coin': coin,
                     'buy_price': pos['buy_price'],
                     'amount': pos['amount'],
-                    'buy_time': pos['timestamp']
-                })
-            
-            # 전체 수익률
-            if self.initial_balance > 0:
-                total_return = ((total_value - self.initial_balance) / self.initial_balance) * 100
-            else:
-                total_return = 0
-            
-            # 승률
-            win_rate = (self.wins / self.total_trades * 100) if self.total_trades > 0 else 0
-            
-            # 평균 수익
-            avg_profit = self.total_profit_krw / self.total_trades if self.total_trades > 0 else 0
-            avg_profit_after_fees = (
-                self.total_profit_after_fees_krw / self.total_trades if self.total_trades > 0 else 0
-            )
-            
-            # 거래 시간
-            if self.start_time:
-                trading_duration = datetime.now() - self.start_time
-                hours = trading_duration.total_seconds() / 3600
-            else:
-                hours = 0
-            
-            return {
-                'initial_balance': self.initial_balance,
-                'current_balance': self.current_balance,
-                'total_value': total_value,
-                'total_return': total_return,
-                'total_profit_krw': self.total_profit_krw,
-                'total_profit_after_fees_krw': self.total_profit_after_fees_krw,
-                'total_fees_krw': self.total_fees,
-                'total_trades': self.total_trades,
-                'wins': self.wins,
-                'losses': self.losses,
-                'win_rate': win_rate,
-                'avg_profit': avg_profit,
-                'avg_profit_after_fees': avg_profit_after_fees,
-                'max_drawdown': self.max_drawdown,
-                'positions': position_details,
-                'trading_hours': hours,
-                'start_time': self.start_time.strftime('%Y-%m-%d %H:%M:%S') if self.start_time else None
-            }
+                    'buy_time': pos['timestamp'],
+                }
+                for coin, pos in self.positions.items()
+            ]
+
+        # 락 밖에서 현재가 조회 (네트워크 호출)
+        total_value = base_balance
+        position_details = []
+        for snap in positions_snapshot:
+            coin = snap['coin']
+            current_price = pyupbit.get_current_price(coin)
+            if not current_price:
+                current_price = snap['buy_price']
+            total_value += current_price * snap['amount']
+            position_details.append(snap)
+
+        # 수익률/통계 계산
+        if initial_balance > 0:
+            total_return = ((total_value - initial_balance) / initial_balance) * 100
+        else:
+            total_return = 0
+
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        avg_profit = total_profit_krw / total_trades if total_trades > 0 else 0
+        avg_profit_after_fees = total_profit_after_fees_krw / total_trades if total_trades > 0 else 0
+
+        if start_time:
+            hours = (datetime.now() - start_time).total_seconds() / 3600
+        else:
+            hours = 0
+
+        return {
+            'initial_balance': initial_balance,
+            'current_balance': base_balance,
+            'total_value': total_value,
+            'total_return': total_return,
+            'total_profit_krw': total_profit_krw,
+            'total_profit_after_fees_krw': total_profit_after_fees_krw,
+            'total_fees_krw': total_fees,
+            'total_trades': total_trades,
+            'wins': wins,
+            'losses': losses,
+            'win_rate': win_rate,
+            'avg_profit': avg_profit,
+            'avg_profit_after_fees': avg_profit_after_fees,
+            'max_drawdown': max_drawdown,
+            'positions': position_details,
+            'trading_hours': hours,
+            'start_time': start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else None
+        }
     
     def get_coin_stats(self):
         """코인별 통계 조회"""
@@ -322,41 +332,46 @@ class TradingStats:
         return status
     
     def save_positions(self):
-        """포지션 스냅샷 저장"""
+        """포지션 스냅샷 저장 (스레드 안전 + 원자적 파일 쓰기)"""
         try:
-            snapshot = {
-                'timestamp': datetime.now().isoformat(),
-                'positions': {}
-            }
-            
-            for coin, pos in self.positions.items():
-                snapshot['positions'][coin] = {
-                    'buy_price': pos['buy_price'],
-                    'amount': pos['amount'],
-                    'original_amount': pos['original_amount'],
-                    'timestamp': pos['timestamp'].isoformat(),
-                    'highest_price': pos['highest_price'],
-                    'uuid': pos.get('uuid'),
-                    'buy_fee_krw': pos.get('buy_fee_krw', 0),
-                    'buy_signals': pos.get('buy_signals', []),
-                    'buy_score': pos.get('buy_score', 0),
-                    'buy_meta': pos.get('buy_meta', {}),
+            with self.lock:
+                snapshot = {
+                    'timestamp': datetime.now().isoformat(),
+                    'positions': {}
                 }
-            
-            with open(self.position_file, 'w') as f:
-                json.dump(snapshot, f, indent=2)
+                for coin, pos in self.positions.items():
+                    snapshot['positions'][coin] = {
+                        'buy_price': pos['buy_price'],
+                        'amount': pos['amount'],
+                        'original_amount': pos['original_amount'],
+                        'timestamp': pos['timestamp'].isoformat(),
+                        'highest_price': pos['highest_price'],
+                        'uuid': pos.get('uuid'),
+                        'buy_fee_krw': pos.get('buy_fee_krw', 0),
+                        'buy_signals': pos.get('buy_signals', []),
+                        'buy_score': pos.get('buy_score', 0),
+                        'buy_meta': pos.get('buy_meta', {}),
+                    }
+                data = json.dumps(snapshot, indent=2)
+
+            # 락 밖에서 원자적 파일 쓰기 (임시 파일 → rename)
+            dir_name = os.path.dirname(os.path.abspath(self.position_file))
+            with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, suffix='.tmp') as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            os.replace(tmp_path, self.position_file)
         except Exception as e:
             print(f"포지션 저장 실패: {e}")
     
     def load_positions(self):
-        """포지션 스냅샷 로드"""
+        """포지션 스냅샷 로드 (손상된 파일 자동 백업 후 복구)"""
+        if not os.path.exists(self.position_file):
+            return {}
+
         try:
-            if not os.path.exists(self.position_file):
-                return {}
-            
             with open(self.position_file, 'r') as f:
                 snapshot = json.load(f)
-            
+
             positions = {}
             for coin, pos in snapshot.get('positions', {}).items():
                 positions[coin] = {
@@ -371,10 +386,16 @@ class TradingStats:
                     'buy_score': int(pos.get('buy_score', 0) or 0),
                     'buy_meta': pos.get('buy_meta', {}) if isinstance(pos.get('buy_meta'), dict) else {},
                 }
-            
             return positions
+
         except Exception as e:
-            print(f"포지션 로드 실패: {e}")
+            # 손상된 파일은 백업 후 빈 상태로 시작
+            backup_path = self.position_file + '.corrupted'
+            try:
+                os.replace(self.position_file, backup_path)
+                print(f"포지션 파일 손상 — 백업 저장: {backup_path} | 오류: {e}")
+            except Exception as backup_err:
+                print(f"포지션 로드 실패: {e} | 백업 실패: {backup_err}")
             return {}
     
     def _save_trade_to_file(self, trade_record):

@@ -406,7 +406,8 @@ class TradingEngine:
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(self.rsi_period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(self.rsi_period).mean()
-        rs = gain / loss
+        # loss == 0 이면 가격이 계속 상승 → RSI = 100
+        rs = gain / loss.replace(0, float('nan'))
         return 100 - (100 / (1 + rs))
 
     def _calc_true_range(self, df):
@@ -570,7 +571,11 @@ class TradingEngine:
     def _persist_position_meta(self, ticker, position, buy_meta):
         if not isinstance(position, dict):
             return
-        position["buy_meta"] = buy_meta if isinstance(buy_meta, dict) else {}
+        # stats.lock을 잡고 포지션이 여전히 유효한지 확인 후 수정
+        with self.stats.lock:
+            if ticker not in self.stats.positions:
+                return
+            position["buy_meta"] = buy_meta if isinstance(buy_meta, dict) else {}
         try:
             self.stats.save_positions()
         except Exception:
